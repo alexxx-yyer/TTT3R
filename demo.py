@@ -113,6 +113,39 @@ def parse_args():
         default=1,
         help="Downsample factor for the point cloud viewer",
     )
+    parser.add_argument(
+        "--lazy_load",
+        action="store_true",
+        help="Use lazy loading to reduce memory usage for long sequences",
+    )
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=100,
+        help="Save interval for streaming inference (default: 100 frames per chunk)",
+    )
+    parser.add_argument(
+        "--save_ply",
+        action="store_true",
+        help="Save point clouds as PLY files (per-frame and combined)",
+    )
+    parser.add_argument(
+        "--conf_threshold",
+        type=float,
+        default=1.0,
+        help="Confidence threshold for point cloud filtering (default: 1.0)",
+    )
+    parser.add_argument(
+        "--skip_viewer",
+        action="store_true",
+        help="Skip launching the point cloud viewer (useful for batch processing)",
+    )
+    parser.add_argument(
+        "--voxel_size",
+        type=float,
+        default=0.02,
+        help="Voxel size for downsampling combined point cloud (default: 0.02, set 0 to disable)",
+    )
     return parser.parse_args()
 
 
@@ -229,6 +262,75 @@ def prepare_input(
         return new_views
 
     return views
+
+
+class LazyViewLoader:
+    """
+    Lazy view loader that loads images on demand.
+    Compatible with forward_recurrent_lighter's iteration pattern.
+    """
+    def __init__(self, img_paths, size, reset_interval=10000):
+        from src.dust3r.utils.image import LazyImageLoader
+        self.img_loader = LazyImageLoader(img_paths, size)
+        self.size = size
+        self.reset_interval = reset_interval
+        self._len = len(self.img_loader)
+
+    def __len__(self):
+        return self._len
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def _load_single_view(self, idx):
+        """Load a single view at index."""
+        img_data = self.img_loader[idx]
+        view = {
+            "img": img_data["img"],
+            "ray_map": torch.full(
+                (
+                    img_data["img"].shape[0],
+                    6,
+                    img_data["img"].shape[-2],
+                    img_data["img"].shape[-1],
+                ),
+                torch.nan,
+            ),
+            "true_shape": torch.from_numpy(img_data["true_shape"]),
+            "idx": idx,
+            "instance": str(idx),
+            "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(0),
+            "img_mask": torch.tensor(True).unsqueeze(0),
+            "ray_mask": torch.tensor(False).unsqueeze(0),
+            "update": torch.tensor(True).unsqueeze(0),
+            "reset": torch.tensor((idx + 1) % self.reset_interval == 0).unsqueeze(0),
+        }
+        return view
+
+    def __getitem__(self, idx):
+        """Load view(s) at index on demand. Supports both int and slice."""
+        if isinstance(idx, slice):
+            indices = range(*idx.indices(self._len))
+            return [self._load_single_view(i) for i in indices]
+        else:
+            return self._load_single_view(idx)
+
+
+def prepare_input_lazy(img_paths, size, reset_interval=10000):
+    """
+    Prepare a lazy view loader for inference.
+    Images are loaded on demand, reducing memory usage for long sequences.
+
+    Args:
+        img_paths (list or str): List of image file paths or folder path.
+        size (int): Target image size.
+        reset_interval (int): Interval for state reset.
+
+    Returns:
+        LazyViewLoader: A lazy loader that yields views on demand.
+    """
+    return LazyViewLoader(img_paths, size, reset_interval)
 
 
 def prepare_output(outputs, outdir, revisit=1, use_pose=True):
@@ -416,6 +518,201 @@ def parse_seq_path(p, frame_interval=1):
     return img_paths, tmpdirname
 
 
+def write_ply_binary(filename, points, colors, confidence=None):
+    """
+    Write point cloud to PLY file in binary format.
+
+    Args:
+        filename: Output PLY file path
+        points: numpy array of shape [N, 3] containing xyz coordinates
+        colors: numpy array of shape [N, 3] containing RGB colors (0-1 range)
+        confidence: numpy array of shape [N] containing confidence values (optional)
+    """
+    N = points.shape[0]
+    if N == 0:
+        print(f"Warning: No points to write to {filename}")
+        return
+
+    points = np.ascontiguousarray(points, dtype=np.float32)
+    colors_uint8 = (np.clip(colors, 0, 1) * 255).astype(np.uint8)
+
+    with open(filename, 'wb') as f:
+        f.write(b'ply\n')
+        f.write(b'format binary_little_endian 1.0\n')
+        f.write(f'element vertex {N}\n'.encode('ascii'))
+        f.write(b'property float x\n')
+        f.write(b'property float y\n')
+        f.write(b'property float z\n')
+        f.write(b'property uchar red\n')
+        f.write(b'property uchar green\n')
+        f.write(b'property uchar blue\n')
+        if confidence is not None:
+            f.write(b'property float confidence\n')
+        f.write(b'end_header\n')
+
+        # Write in batches for efficiency
+        batch_size = 100000
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            pts_batch = points[start:end]
+            col_batch = colors_uint8[start:end]
+
+            if confidence is not None:
+                conf_batch = np.ascontiguousarray(confidence[start:end], dtype=np.float32)
+                # Create structured array for efficient writing
+                dtype = np.dtype([('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                                  ('r', 'u1'), ('g', 'u1'), ('b', 'u1'), ('conf', 'f4')])
+                data = np.empty(end - start, dtype=dtype)
+                data['x'] = pts_batch[:, 0]
+                data['y'] = pts_batch[:, 1]
+                data['z'] = pts_batch[:, 2]
+                data['r'] = col_batch[:, 0]
+                data['g'] = col_batch[:, 1]
+                data['b'] = col_batch[:, 2]
+                data['conf'] = conf_batch
+            else:
+                dtype = np.dtype([('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                                  ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
+                data = np.empty(end - start, dtype=dtype)
+                data['x'] = pts_batch[:, 0]
+                data['y'] = pts_batch[:, 1]
+                data['z'] = pts_batch[:, 2]
+                data['r'] = col_batch[:, 0]
+                data['g'] = col_batch[:, 1]
+                data['b'] = col_batch[:, 2]
+
+            f.write(data.tobytes())
+
+
+def voxel_downsample(points, colors, confs, voxel_size):
+    """
+    Voxel downsampling - keep one point per voxel (the one with highest confidence).
+
+    Args:
+        points: [N, 3] numpy array
+        colors: [N, 3] numpy array
+        confs: [N] numpy array
+        voxel_size: Size of voxel grid
+
+    Returns:
+        Downsampled points, colors, confs
+    """
+    if voxel_size <= 0 or len(points) == 0:
+        return points, colors, confs
+
+    # Compute voxel indices
+    voxel_indices = np.floor(points / voxel_size).astype(np.int32)
+
+    # Create unique voxel keys
+    # Shift to positive indices
+    min_indices = voxel_indices.min(axis=0)
+    voxel_indices = voxel_indices - min_indices
+
+    # Create a single integer key for each voxel
+    max_idx = voxel_indices.max(axis=0) + 1
+    voxel_keys = (voxel_indices[:, 0] * max_idx[1] * max_idx[2] +
+                  voxel_indices[:, 1] * max_idx[2] +
+                  voxel_indices[:, 2])
+
+    # Find unique voxels and keep point with highest confidence
+    unique_keys, inverse_indices = np.unique(voxel_keys, return_inverse=True)
+
+    # For each unique voxel, find the point with highest confidence
+    n_voxels = len(unique_keys)
+    best_indices = np.zeros(n_voxels, dtype=np.int64)
+    best_confs = np.full(n_voxels, -np.inf)
+
+    for i, (key_idx, conf) in enumerate(zip(inverse_indices, confs)):
+        if conf > best_confs[key_idx]:
+            best_confs[key_idx] = conf
+            best_indices[key_idx] = i
+
+    return points[best_indices], colors[best_indices], confs[best_indices]
+
+
+def save_pointclouds(pts3ds_list, colors_list, conf_list, output_dir, conf_threshold=1.0, voxel_size=0.02):
+    """
+    Save point clouds as PLY files (per-frame and combined).
+
+    Args:
+        pts3ds_list: List of point cloud tensors [B, H, W, 3]
+        colors_list: List of color tensors [B, H, W, 3]
+        conf_list: List of confidence tensors [B, H, W]
+        output_dir: Output directory
+        conf_threshold: Confidence threshold for filtering
+        voxel_size: Voxel size for downsampling combined point cloud (0 to disable)
+
+    Returns:
+        combined_ply_path: Path to the combined PLY file
+    """
+    pcd_dir = os.path.join(output_dir, "pcd")
+    os.makedirs(pcd_dir, exist_ok=True)
+
+    num_frames = len(pts3ds_list)
+    print(f"Saving {num_frames} point cloud frames to {pcd_dir}...")
+
+    # Collect all points for combined PLY
+    all_points = []
+    all_colors = []
+    all_confs = []
+
+    for i in range(num_frames):
+        # Get data for this frame
+        pts = pts3ds_list[i].cpu().numpy() if hasattr(pts3ds_list[i], 'cpu') else pts3ds_list[i]
+        cols = colors_list[i].cpu().numpy() if hasattr(colors_list[i], 'cpu') else colors_list[i]
+        conf = conf_list[i].cpu().numpy() if hasattr(conf_list[i], 'cpu') else conf_list[i]
+
+        # Reshape to [N, 3] and [N]
+        pts_flat = pts.reshape(-1, 3)
+        cols_flat = cols.reshape(-1, 3)
+        conf_flat = conf.reshape(-1)
+
+        # Filter by confidence
+        valid_mask = (conf_flat >= conf_threshold) & ~np.isnan(pts_flat).any(axis=1)
+        pts_valid = pts_flat[valid_mask]
+        cols_valid = cols_flat[valid_mask]
+        conf_valid = conf_flat[valid_mask]
+
+        # Save per-frame PLY
+        ply_path = os.path.join(pcd_dir, f"{i:06d}.ply")
+        write_ply_binary(ply_path, pts_valid, cols_valid, conf_valid)
+
+        # Collect for combined
+        all_points.append(pts_valid)
+        all_colors.append(cols_valid)
+        all_confs.append(conf_valid)
+
+        if (i + 1) % 100 == 0:
+            print(f"  Saved {i + 1}/{num_frames} frames...")
+
+    print(f"Saved {num_frames} per-frame PLY files to {pcd_dir}/")
+
+    # Save combined PLY
+    combined_ply_path = os.path.join(pcd_dir, "combined.ply")
+    print(f"Saving combined point cloud to {combined_ply_path}...")
+
+    combined_points = np.vstack(all_points) if all_points else np.empty((0, 3))
+    combined_colors = np.vstack(all_colors) if all_colors else np.empty((0, 3))
+    combined_confs = np.concatenate(all_confs) if all_confs else np.empty(0)
+
+    print(f"  Total points before downsampling: {len(combined_points):,}")
+
+    # Apply voxel downsampling to reduce file size
+    if voxel_size > 0 and len(combined_points) > 0:
+        print(f"  Applying voxel downsampling (voxel_size={voxel_size})...")
+        combined_points, combined_colors, combined_confs = voxel_downsample(
+            combined_points, combined_colors, combined_confs, voxel_size
+        )
+        print(f"  Points after downsampling: {len(combined_points):,}")
+
+    write_ply_binary(combined_ply_path, combined_points, combined_colors, combined_confs)
+
+    file_size = os.path.getsize(combined_ply_path) / (1024 * 1024)
+    print(f"  Combined PLY size: {file_size:.2f} MB")
+
+    return combined_ply_path
+
+
 def run_inference(args):
     """
     Execute the full inference and visualization pipeline.
@@ -433,7 +730,7 @@ def run_inference(args):
     add_path_to_dust3r(args.model_path)
 
     # Import model and inference functions after adding the ckpt path.
-    from src.dust3r.inference import inference, inference_recurrent, inference_recurrent_lighter
+    from src.dust3r.inference import inference, inference_recurrent, inference_recurrent_lighter, inference_recurrent_streaming, load_streaming_results
     from src.dust3r.model import ARCroco3DStereo
     from viser_utils import PointCloudViewer
 
@@ -444,19 +741,29 @@ def run_inference(args):
         return
 
     print(f"Found {len(img_paths)} images in {args.seq_path}.")
-    img_mask = [True] * len(img_paths)
 
-    # Prepare input views.
-    print("Preparing input views...")
-    views = prepare_input(
-        img_paths=img_paths,
-        img_mask=img_mask,
-        size=args.size,
-        revisit=1,
-        update=True,
-        reset_interval=args.reset_interval
-    )
-    if tmpdirname is not None:
+    # Prepare input views (lazy or eager loading).
+    if args.lazy_load:
+        print("Preparing input views (lazy loading - memory efficient)...")
+        views = prepare_input_lazy(
+            img_paths=img_paths,
+            size=args.size,
+            reset_interval=args.reset_interval
+        )
+    else:
+        print("Preparing input views (eager loading)...")
+        img_mask = [True] * len(img_paths)
+        views = prepare_input(
+            img_paths=img_paths,
+            img_mask=img_mask,
+            size=args.size,
+            revisit=1,
+            update=True,
+            reset_interval=args.reset_interval
+        )
+    # For eager loading, we can clean up temp dir now since images are in memory.
+    # For lazy loading, we must wait until after inference to clean up.
+    if tmpdirname is not None and not args.lazy_load:
         shutil.rmtree(tmpdirname)
 
     # Load and prepare the model.
@@ -469,44 +776,90 @@ def run_inference(args):
     # Run inference.
     print("Running inference...")
     start_time = time.time()
-    outputs, state_args = inference_recurrent_lighter(views, model, device)
 
-    total_time = time.time() - start_time
-    per_frame_time = total_time / len(views)
-    FPS_num = 1 / per_frame_time
-    print(
-        f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame), FPS: {FPS_num:.2f}."
-    )
+    if args.lazy_load:
+        # Use streaming inference for memory efficiency
+        os.makedirs(args.output_dir, exist_ok=True)
+        cache_dir = os.path.join(args.output_dir, "inference_cache")
+        metadata, state_args = inference_recurrent_streaming(
+            views, model, device, cache_dir, verbose=True, save_interval=args.save_interval
+        )
 
-    # Process outputs for visualization.
-    print("Preparing output for visualization...")
-    pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True
-    )
+        total_time = time.time() - start_time
+        per_frame_time = total_time / len(views)
+        FPS_num = 1 / per_frame_time
+        print(
+            f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame), FPS: {FPS_num:.2f}."
+        )
+
+        # Clean up temp directory after inference
+        if tmpdirname is not None:
+            shutil.rmtree(tmpdirname)
+
+        # Load results from cache and process
+        print("Loading results from cache and preparing output...")
+        outputs = load_streaming_results(metadata)
+        pts3ds_other, colors, conf, cam_dict = prepare_output(
+            outputs, args.output_dir, 1, True
+        )
+
+        # Clean up cache after processing
+        print("Cleaning up inference cache...")
+        shutil.rmtree(cache_dir)
+    else:
+        outputs, state_args = inference_recurrent_lighter(views, model, device)
+
+        total_time = time.time() - start_time
+        per_frame_time = total_time / len(views)
+        FPS_num = 1 / per_frame_time
+        print(
+            f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame), FPS: {FPS_num:.2f}."
+        )
+
+        # Process outputs for visualization.
+        print("Preparing output for visualization...")
+        pts3ds_other, colors, conf, cam_dict = prepare_output(
+            outputs, args.output_dir, 1, True
+        )
 
     # Convert tensors to numpy arrays for visualization.
     pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
     colors_to_vis = [c.cpu().numpy() for c in colors]
     edge_colors = [None] * len(pts3ds_to_vis)
 
-    # Create and run the point cloud viewer.
-    print("Launching point cloud viewer...")
-    viewer = PointCloudViewer(
-        model,
-        state_args,
-        pts3ds_to_vis,
-        colors_to_vis,
-        conf,
-        cam_dict,
-        device=device,
-        edge_color_list=edge_colors,
-        show_camera=True,
-        vis_threshold=args.vis_threshold,
-        size = args.size,
-        port = args.port,
-        downsample_factor=args.downsample_factor
-    )
-    viewer.run()
+    # Save point clouds as PLY files if requested
+    if args.save_ply:
+        print("\nSaving point clouds...")
+        combined_ply = save_pointclouds(
+            pts3ds_other, colors, conf, args.output_dir, args.conf_threshold, args.voxel_size
+        )
+        print(f"\nPoint clouds saved to {args.output_dir}/pcd/")
+        print(f"  - Per-frame: {args.output_dir}/pcd/000000.ply, ...")
+        print(f"  - Combined:  {combined_ply}")
+        print("\nView with: meshlab " + combined_ply)
+
+    # Create and run the point cloud viewer (unless skipped)
+    if args.skip_viewer:
+        print("\nSkipping point cloud viewer (--skip_viewer specified)")
+        print("Processing complete!")
+    else:
+        print("Launching point cloud viewer...")
+        viewer = PointCloudViewer(
+            model,
+            state_args,
+            pts3ds_to_vis,
+            colors_to_vis,
+            conf,
+            cam_dict,
+            device=device,
+            edge_color_list=edge_colors,
+            show_camera=True,
+            vis_threshold=args.vis_threshold,
+            size = args.size,
+            port = args.port,
+            downsample_factor=args.downsample_factor
+        )
+        viewer.run()
 
 
 def main():

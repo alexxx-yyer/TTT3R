@@ -117,6 +117,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         pose_conf_head=False,
         pose_head=False,
         model_update_type="cut3r",
+        # Loop closure config
+        enable_loop_closure=True,
+        max_keyframes=100,
+        loop_threshold=0.85,
+        min_frame_gap=30,
+        keyframe_interval=10,
+        mem_decay_rate=0.995,
         **croco_kwargs,
     ):
         super().__init__()
@@ -138,6 +145,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
         self.model_update_type = model_update_type
+        # Loop closure config
+        self.enable_loop_closure = enable_loop_closure
+        self.max_keyframes = max_keyframes
+        self.loop_threshold = loop_threshold
+        self.min_frame_gap = min_frame_gap
+        self.keyframe_interval = keyframe_interval
+        self.mem_decay_rate = mem_decay_rate
         self.croco_kwargs = croco_kwargs
 
 
@@ -205,13 +219,24 @@ class LocalMemory(nn.Module):
             ]
         )
 
-    def update_mem(self, mem, feat_k, feat_v, return_attn=False):
+    def update_mem(self, mem, feat_k, feat_v, decay_rate=1.0, return_attn=False):
         """
-        mem_k: [B, size, C]
-        mem_v: [B, size, C]
-        feat_k: [B, 1, C] global_img_feat
-        feat_v: [B, 1, C] out_pose_feat
+        Update memory with optional decay mechanism.
+
+        Args:
+            mem: [B, size, C] current memory
+            feat_k: [B, 1, C] global_img_feat (key)
+            feat_v: [B, 1, C] out_pose_feat (value)
+            decay_rate: float, memory decay rate (0.0-1.0). Default 1.0 means no decay.
+            return_attn: bool, whether to return attention maps
+
+        Returns:
+            mem: [B, size, C] updated memory
         """
+        # Apply memory decay to reduce accumulation of old errors
+        if decay_rate < 1.0:
+            mem = mem * decay_rate
+
         feat_k = self.proj_q(feat_k)  # [B, 1, C]
         feat = torch.cat([feat_k, feat_v], dim=-1)
 
@@ -229,6 +254,222 @@ class LocalMemory(nn.Module):
             x, _, self_attn, cross_attn = blk(x, mem, None, None, return_attn=return_attn)
             attention_maps.append((self_attn, cross_attn))
         return x[..., -self.v_dim :]
+
+
+class KeyframeDatabase(nn.Module):
+    """Store keyframe features for loop closure detection (inference only)"""
+    def __init__(self, max_keyframes=100, feat_dim=1024):
+        super().__init__()
+        self.max_keyframes = max_keyframes
+        self.feat_dim = feat_dim
+        # Runtime buffers (not learnable parameters)
+        self.register_buffer('features', torch.zeros(1, max_keyframes, feat_dim))
+        self.register_buffer('poses', torch.zeros(1, max_keyframes, 7))
+        self.register_buffer('frame_ids', torch.zeros(1, max_keyframes, dtype=torch.long))
+        self.register_buffer('count', torch.zeros(1, dtype=torch.long))
+
+    def reset(self, batch_size, device=None):
+        """Reset database for new sequence"""
+        if device is None:
+            device = self.features.device
+        self.features = torch.zeros(batch_size, self.max_keyframes, self.feat_dim, device=device)
+        self.poses = torch.zeros(batch_size, self.max_keyframes, 7, device=device)
+        self.frame_ids = torch.zeros(batch_size, self.max_keyframes, dtype=torch.long, device=device)
+        self.count = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    def add_keyframe(self, feat, pose, frame_id, batch_mask=None):
+        """
+        Add keyframe to database
+        Args:
+            feat: [B, 1, feat_dim] global image feature
+            pose: [B, 7] camera pose (tx, ty, tz, qw, qx, qy, qz)
+            frame_id: int, current frame index
+            batch_mask: [B] optional mask for which batches to update
+        """
+        B = feat.shape[0]
+        for b in range(B):
+            if batch_mask is not None and not batch_mask[b]:
+                continue
+            idx = self.count[b] % self.max_keyframes
+            self.features[b, idx] = feat[b, 0]
+            self.poses[b, idx] = pose[b]
+            self.frame_ids[b, idx] = frame_id
+            self.count[b] += 1
+
+    def query(self, feat, top_k=5):
+        """
+        Query most similar keyframes
+        Args:
+            feat: [B, 1, feat_dim] query feature
+            top_k: number of candidates to return
+        Returns:
+            top_sim: [B, top_k] similarity scores
+            top_idx: [B, top_k] keyframe indices
+            top_poses: [B, top_k, 7] keyframe poses
+            top_frame_ids: [B, top_k] keyframe frame indices
+        """
+        B = feat.shape[0]
+        # Normalize features for cosine similarity
+        feat_norm = F.normalize(feat[:, 0], dim=-1)  # [B, feat_dim]
+        db_norm = F.normalize(self.features, dim=-1)  # [B, max_kf, feat_dim]
+
+        # Compute similarities
+        similarities = torch.bmm(feat_norm.unsqueeze(1), db_norm.transpose(1, 2)).squeeze(1)
+        # [B, max_kf]
+
+        # Mask unused slots
+        valid_mask = torch.arange(self.max_keyframes, device=feat.device).unsqueeze(0) < self.count.unsqueeze(1)
+        similarities = similarities.masked_fill(~valid_mask, -1e9)
+
+        # Get top-k
+        actual_k = min(top_k, self.max_keyframes)
+        top_sim, top_idx = similarities.topk(actual_k, dim=-1)
+
+        # Gather corresponding poses and frame ids
+        top_poses = torch.gather(self.poses, 1, top_idx.unsqueeze(-1).expand(-1, -1, 7))
+        top_frame_ids = torch.gather(self.frame_ids, 1, top_idx)
+
+        return top_sim, top_idx, top_poses, top_frame_ids
+
+
+class LoopDetector(nn.Module):
+    """
+    Detect loop closure based on feature similarity (no learnable parameters).
+
+    Uses cosine similarity between current frame features and keyframe database
+    to detect when the camera returns to a previously visited location.
+    """
+    def __init__(self, feat_dim=1024, threshold=0.85, min_frame_gap=30):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.threshold = threshold
+        self.min_frame_gap = min_frame_gap
+
+    def forward(self, current_feat, keyframe_db, current_frame_id):
+        """
+        Detect loop closure
+        Args:
+            current_feat: [B, 1, feat_dim] current frame feature
+            keyframe_db: KeyframeDatabase instance
+            current_frame_id: int, current frame index
+        Returns:
+            loop_detected: [B] bool tensor
+            loop_frame_id: [B] matched frame id
+            loop_pose: [B, 7] matched pose
+            confidence: [B] confidence score
+        """
+        B = current_feat.shape[0]
+        device = current_feat.device
+
+        # Query keyframe database
+        top_sim, top_idx, top_poses, top_frame_ids = keyframe_db.query(current_feat, top_k=5)
+
+        # Check temporal gap (avoid matching recent frames)
+        frame_gap = current_frame_id - top_frame_ids  # [B, 5]
+        valid_gap = frame_gap >= self.min_frame_gap
+
+        # Select best valid match
+        masked_sim = top_sim.masked_fill(~valid_gap, -1e9)
+        best_sim, best_idx = masked_sim.max(dim=-1)  # [B]
+
+        # Get corresponding pose and frame id
+        batch_idx = torch.arange(B, device=device)
+        loop_pose = top_poses[batch_idx, best_idx]  # [B, 7]
+        loop_frame_id = top_frame_ids[batch_idx, best_idx]  # [B]
+
+        # Determine if loop is detected
+        loop_detected = best_sim > self.threshold
+
+        # Confidence is the similarity score (clamped)
+        confidence = torch.clamp(best_sim, 0.0, 1.0)
+
+        return loop_detected, loop_frame_id, loop_pose, confidence
+
+
+class LoopCorrector(nn.Module):
+    """
+    Geometric loop closure corrector (no learnable parameters).
+
+    When a loop is detected, this module applies a soft correction to the
+    state and memory based on the pose discrepancy. The idea is that when
+    we return to a previously visited location, we should partially reset
+    our accumulated state to reduce drift.
+    """
+    def __init__(self, state_dim=768, mem_dim=1536, pose_dim=7,
+                 state_correction_strength=0.3, mem_correction_strength=0.2):
+        super().__init__()
+        self.state_dim = state_dim
+        self.mem_dim = mem_dim
+        # Hyperparameters (not learned)
+        self.state_correction_strength = state_correction_strength
+        self.mem_correction_strength = mem_correction_strength
+
+    def _compute_pose_error(self, current_pose, loop_pose):
+        """
+        Compute pose error magnitude between current and loop pose.
+
+        Args:
+            current_pose: [B, 7] (tx, ty, tz, qw, qx, qy, qz)
+            loop_pose: [B, 7]
+
+        Returns:
+            error: [B] normalized pose error in [0, 1]
+        """
+        # Translation error (L2 distance)
+        trans_current = current_pose[:, :3]
+        trans_loop = loop_pose[:, :3]
+        trans_error = torch.norm(trans_current - trans_loop, dim=-1)
+
+        # Rotation error (quaternion distance)
+        quat_current = F.normalize(current_pose[:, 3:], dim=-1)
+        quat_loop = F.normalize(loop_pose[:, 3:], dim=-1)
+        # Quaternion dot product gives cos(angle/2)
+        quat_dot = torch.abs(torch.sum(quat_current * quat_loop, dim=-1))
+        rot_error = 1.0 - quat_dot  # 0 when identical, 1 when opposite
+
+        # Combine errors (normalize translation by typical scale)
+        combined_error = trans_error / (trans_error.mean() + 1e-6) * 0.5 + rot_error * 0.5
+        return torch.clamp(combined_error, 0.0, 1.0)
+
+    def forward(self, state_feat, mem, current_pose, loop_pose, confidence):
+        """
+        Apply geometric loop closure correction.
+
+        When a loop is detected with high confidence but the poses differ,
+        we apply a soft correction that blends the current state towards
+        a more neutral value, effectively reducing accumulated drift.
+
+        Args:
+            state_feat: [B, state_size, state_dim] global state
+            mem: [B, mem_size, mem_dim] local memory
+            current_pose: [B, 7] current estimated pose
+            loop_pose: [B, 7] matched loop pose
+            confidence: [B] detection confidence
+
+        Returns:
+            corrected_state: [B, state_size, state_dim]
+            corrected_mem: [B, mem_size, mem_dim]
+        """
+        # Compute pose discrepancy
+        pose_error = self._compute_pose_error(current_pose, loop_pose)
+
+        # Correction strength: high confidence + high error = strong correction
+        # The intuition: if we're confident we've returned to a place but our
+        # pose estimate differs significantly, we have accumulated drift
+        correction_factor = confidence * pose_error  # [B]
+        correction_factor = correction_factor[:, None, None]  # [B, 1, 1]
+
+        # Apply soft reset to state (blend towards mean)
+        state_mean = state_feat.mean(dim=(1, 2), keepdim=True)
+        state_correction = self.state_correction_strength * correction_factor
+        corrected_state = state_feat * (1 - state_correction) + state_mean * state_correction
+
+        # Apply soft reset to memory (blend towards mean)
+        mem_mean = mem.mean(dim=(1, 2), keepdim=True)
+        mem_correction = self.mem_correction_strength * correction_factor
+        corrected_mem = mem * (1 - mem_correction) + mem_mean * mem_correction
+
+        return corrected_state, corrected_mem
 
 
 class ARCroco3DStereo(CroCoNet):
@@ -277,6 +518,21 @@ class ARCroco3DStereo(CroCoNet):
                 attn_drop=0.0,
                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
                 rope=None,
+            )
+            # Loop closure components (inference only)
+            self.keyframe_db = KeyframeDatabase(
+                max_keyframes=config.max_keyframes,
+                feat_dim=self.enc_embed_dim,
+            )
+            self.loop_detector = LoopDetector(
+                feat_dim=self.enc_embed_dim,
+                threshold=config.loop_threshold,
+                min_frame_gap=config.min_frame_gap,
+            )
+            self.loop_corrector = LoopCorrector(
+                state_dim=self.dec_embed_dim,
+                mem_dim=self.dec_embed_dim * 2,  # mem is 2*v_dim
+                pose_dim=7,
             )
         self.register_tokens = nn.Embedding(config.state_size, self.enc_embed_dim) # init state tokens [768, 1024]
         self.state_size = config.state_size
@@ -803,8 +1059,10 @@ class ARCroco3DStereo(CroCoNet):
             return_attn=False,
         )
         out_pose_feat_i = dec[-1][:, 0:1]
+        _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+        decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
         new_mem = self.pose_retriever.update_mem(
-            mem, global_img_feat_i, out_pose_feat_i
+            mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
         )
         head_input = [
             dec[0].float(),
@@ -872,8 +1130,11 @@ class ARCroco3DStereo(CroCoNet):
                 return_attn=True,
             ) # [1, 768, 768]
             out_pose_feat_i = dec[-1][:, 0:1] # [1, 1, 768] refined pose token from dust3r
+            # update mem with optional decay (disabled during training by default)
+            _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+            decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
             new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i
+                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
             ) # [1, 256, 1536] use mem as query, cross-attend [global_img_feat_i, out_pose_feat_i], get new_mem
             assert len(dec) == self.dec_depth + 1
             head_input = [
@@ -986,8 +1247,10 @@ class ARCroco3DStereo(CroCoNet):
         )
 
         out_pose_feat_i = dec[-1][:, 0:1]
+        _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+        decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
         new_mem = self.pose_retriever.update_mem(
-            mem, global_img_feat_i, out_pose_feat_i
+            mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
         )
         assert len(dec) == self.dec_depth + 1
         head_input = [
@@ -1099,8 +1362,10 @@ class ARCroco3DStereo(CroCoNet):
                 return_attn=False,
             )
             out_pose_feat_i = dec[-1][:, 0:1]
+            _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+            decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
             new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i
+                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
             )
             assert len(dec) == self.dec_depth + 1
             head_input = [
@@ -1206,11 +1471,17 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 raise NotImplementedError
 
+            # Check loop closure config safely
+            _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+
             if i == 0:
                 state_feat, state_pos = self._init_state(feat_i, pos_i)
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                # Initialize keyframe database for loop closure
+                if _enable_lc and self.pose_head_flag:
+                    self.keyframe_db.reset(feat_i.shape[0], device=feat_i.device)
 
             if self.pose_head_flag:
                 global_img_feat_i = self._get_img_level_feat(feat_i)
@@ -1239,9 +1510,10 @@ class ARCroco3DStereo(CroCoNet):
             )
             out_pose_feat_i = dec[-1][:, 0:1]
 
-            # update mem
+            # update mem with optional decay
+            decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
             new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i
+                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
             )
 
             assert len(dec) == self.dec_depth + 1
@@ -1252,6 +1524,32 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth].float(),
             ]
             res = self._downstream_head(head_input, shape, pos=pos_i)
+
+            # Loop closure detection and correction (inference only)
+            if _enable_lc and self.pose_head_flag and i > 0:
+                current_pose = res.get("camera_pose", None)
+                if current_pose is not None:
+                    # Detect loop closure
+                    loop_detected, loop_frame_id, loop_pose, confidence = \
+                        self.loop_detector(global_img_feat_i, self.keyframe_db, i)
+
+                    # Apply correction if loop is detected
+                    if loop_detected.any():
+                        state_feat, mem = self.loop_corrector(
+                            state_feat, mem,
+                            current_pose, loop_pose,
+                            confidence * loop_detected.float()
+                        )
+
+                    # Add keyframe at fixed intervals
+                    _kf_interval = getattr(self.config, 'keyframe_interval', 10)
+                    if i % _kf_interval == 0:
+                        self.keyframe_db.add_keyframe(
+                            global_img_feat_i,
+                            current_pose,
+                            i
+                        )
+
             res_cpu = to_cpu(res)
             ress.append(res_cpu)
             img_mask = view["img_mask"]
@@ -1296,6 +1594,166 @@ class ARCroco3DStereo(CroCoNet):
         if ret_state:
             return ress, views, all_state_args
         return ress, views
+
+    def forward_recurrent_streaming(self, views, device='cuda', ret_state=False):
+        """
+        Streaming version of forward_recurrent_lighter that yields results one by one
+        instead of accumulating them in memory.
+
+        Yields:
+            (frame_idx, res, view, state_args) for each frame
+        """
+        reset_mask = False
+        state_args = None
+
+        for i, _view in enumerate(views):
+            view = to_gpu(_view, device)
+            # Preserve keys ignored by to_gpu
+            if "true_shape" in _view:
+                view["true_shape"] = _view["true_shape"].clone() if hasattr(_view["true_shape"], 'clone') else _view["true_shape"]
+            device = view["img"].device
+            batch_size = view["img"].shape[0]
+            img_mask = view["img_mask"].reshape(-1, batch_size)
+            ray_mask = view["ray_mask"].reshape(-1, batch_size)
+            imgs = view["img"].unsqueeze(0)
+            ray_maps = view["ray_map"].unsqueeze(0)
+            shapes = (
+                view["true_shape"].unsqueeze(0)
+                if "true_shape" in view
+                else torch.tensor(view["img"].shape[-2:], device=device)
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+                .unsqueeze(0)
+            )
+            imgs = imgs.view(-1, *imgs.shape[2:])
+            ray_maps = ray_maps.view(-1, *ray_maps.shape[2:])
+            shapes = shapes.view(-1, 2).to(imgs.device)
+            img_masks_flat = img_mask.view(-1)
+            ray_masks_flat = ray_mask.view(-1)
+            selected_imgs = imgs[img_masks_flat]
+            selected_shapes = shapes[img_masks_flat]
+            if selected_imgs.size(0) > 0:
+                img_out, img_pos, _ = self._encode_image(selected_imgs, selected_shapes)
+            else:
+                img_out, img_pos = None, None
+            ray_maps = ray_maps.permute(0, 3, 1, 2)
+            selected_ray_maps = ray_maps[ray_masks_flat]
+            selected_shapes_ray = shapes[ray_masks_flat]
+            if selected_ray_maps.size(0) > 0:
+                ray_out, ray_pos, _ = self._encode_ray_map(selected_ray_maps, selected_shapes_ray)
+            else:
+                ray_out, ray_pos = None, None
+
+            shape = shapes
+            if img_out is not None and ray_out is None:
+                feat_i = img_out[-1]
+                pos_i = img_pos
+            elif img_out is None and ray_out is not None:
+                feat_i = ray_out[-1]
+                pos_i = ray_pos
+            elif img_out is not None and ray_out is not None:
+                feat_i = img_out[-1] + ray_out[-1]
+                pos_i = img_pos
+            else:
+                raise NotImplementedError
+
+            _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+
+            if i == 0:
+                state_feat, state_pos = self._init_state(feat_i, pos_i)
+                mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
+                init_state_feat = state_feat.clone()
+                init_mem = mem.clone()
+                if _enable_lc and self.pose_head_flag:
+                    self.keyframe_db.reset(feat_i.shape[0], device=feat_i.device)
+
+            if self.pose_head_flag:
+                global_img_feat_i = self._get_img_level_feat(feat_i)
+                if i == 0 or reset_mask:
+                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+                else:
+                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+                pose_pos_i = -torch.ones(feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype)
+            else:
+                pose_feat_i = None
+                pose_pos_i = None
+
+            new_state_feat, dec, self_attn_state, cross_attn_state, self_attn_img, cross_attn_img = self._recurrent_rollout(
+                state_feat, state_pos, feat_i, pos_i, pose_feat_i, pose_pos_i, init_state_feat,
+                img_mask=view["img_mask"], reset_mask=view["reset"],
+                update=view.get("update", None), return_attn=True,
+            )
+            out_pose_feat_i = dec[-1][:, 0:1]
+
+            decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
+            new_mem = self.pose_retriever.update_mem(mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate)
+
+            assert len(dec) == self.dec_depth + 1
+            head_input = [
+                dec[0].float(),
+                dec[self.dec_depth * 2 // 4][:, 1:].float(),
+                dec[self.dec_depth * 3 // 4][:, 1:].float(),
+                dec[self.dec_depth].float(),
+            ]
+            res = self._downstream_head(head_input, shape, pos=pos_i)
+
+            # Loop closure
+            if _enable_lc and self.pose_head_flag and i > 0:
+                current_pose = res.get("camera_pose", None)
+                if current_pose is not None:
+                    loop_detected, loop_frame_id, loop_pose, confidence = \
+                        self.loop_detector(global_img_feat_i, self.keyframe_db, i)
+                    if loop_detected.any():
+                        state_feat, mem = self.loop_corrector(
+                            state_feat, mem, current_pose, loop_pose,
+                            confidence * loop_detected.float()
+                        )
+                    _kf_interval = getattr(self.config, 'keyframe_interval', 10)
+                    if i % _kf_interval == 0:
+                        self.keyframe_db.add_keyframe(global_img_feat_i, current_pose, i)
+
+            # Yield result instead of accumulating
+            if ret_state:
+                state_args = {
+                    "state_feat": state_feat.clone(),
+                    "mem": mem.clone(),
+                    "init_state_feat": init_state_feat.clone(),
+                    "init_mem": init_mem.clone(),
+                    "state_pos": state_pos.clone(),
+                }
+            yield i, res, view, state_args
+
+            # Update state
+            img_mask = view["img_mask"]
+            update = view.get("update", None)
+            if update is not None:
+                update_mask = img_mask & update
+            else:
+                update_mask = img_mask
+            update_mask = update_mask[:, None, None].float()
+
+            if i == 0 or reset_mask:
+                update_mask1 = update_mask
+            else:
+                if self.config.model_update_type == "cut3r":
+                    update_mask1 = update_mask
+                elif self.config.model_update_type == "ttt3r":
+                    cross_attn_state = rearrange(torch.cat(cross_attn_state, dim=0), 'l h nstate nimg -> 1 nstate nimg (l h)')
+                    state_query_img_key = cross_attn_state.mean(dim=(-1, -2))
+                    update_mask1 = update_mask * torch.sigmoid(state_query_img_key)[..., None] * 1.0
+                else:
+                    raise ValueError(f"Invalid model type: {self.config.model_update_type}")
+
+            update_mask2 = update_mask
+            state_feat = new_state_feat * update_mask1 + state_feat * (1 - update_mask1)
+            mem = new_mem * update_mask2 + mem * (1 - update_mask2)
+
+            reset_mask = view["reset"]
+            if reset_mask is not None:
+                reset_mask_float = reset_mask[:, None, None].float()
+                state_feat = init_state_feat * reset_mask_float + state_feat * (1 - reset_mask_float)
+                mem = init_mem * reset_mask_float + mem * (1 - reset_mask_float)
+
 
 if __name__ == "__main__":
     print(ARCroco3DStereo.mro())

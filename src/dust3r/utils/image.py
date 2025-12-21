@@ -133,6 +133,101 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True):
     return imgs
 
 
+def load_single_image(path, size, square_ok=False):
+    """Load and preprocess a single image (for lazy loading)."""
+    img = exif_transpose(PIL.Image.open(path)).convert("RGB")
+    W1, H1 = img.size
+    if size == 224:
+        img = _resize_pil_image(img, round(size * max(W1 / H1, H1 / W1)))
+    else:
+        img = _resize_pil_image(img, size)
+    W, H = img.size
+    cx, cy = W // 2, H // 2
+    if size == 224:
+        half = min(cx, cy)
+        img = img.crop((cx - half, cy - half, cx + half, cy + half))
+    else:
+        halfw, halfh = ((2 * cx) // 16) * 8, ((2 * cy) // 16) * 8
+        if not (square_ok) and W == H:
+            halfh = 3 * halfw / 4
+        img = img.crop((cx - halfw, cy - halfh, cx + halfw, cy + halfh))
+    return dict(
+        img=ImgNorm(img)[None],
+        true_shape=np.int32([img.size[::-1]]),
+    )
+
+
+class LazyImageLoader:
+    """
+    Lazy image loader that stores paths and loads images on demand.
+    This significantly reduces memory usage for long sequences.
+    """
+    def __init__(self, folder_or_list, size, square_ok=False, verbose=True):
+        self.size = size
+        self.square_ok = square_ok
+
+        if isinstance(folder_or_list, str):
+            if verbose:
+                print(f">> Preparing lazy loader for images from {folder_or_list}")
+            root = folder_or_list
+            folder_content = sorted(os.listdir(folder_or_list))
+        elif isinstance(folder_or_list, list):
+            if verbose:
+                print(f">> Preparing lazy loader for {len(folder_or_list)} images")
+            root = ""
+            folder_content = folder_or_list
+        else:
+            raise ValueError(f"bad {folder_or_list=} ({type(folder_or_list)})")
+
+        supported_extensions = (".jpg", ".jpeg", ".png", ".bmp")
+        if heif_support_enabled:
+            supported_extensions = supported_extensions + (".heic", ".heif")
+
+        self.paths = []
+        for path in folder_content:
+            if path.lower().endswith(supported_extensions):
+                self.paths.append(os.path.join(root, path) if root else path)
+
+        if verbose:
+            print(f" (Found {len(self.paths)} images, will load on demand)")
+
+        # Cache for recently loaded images (optional, can be disabled)
+        self._cache = {}
+        self._cache_size = 0  # 0 means no caching
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        """Load image at index, with optional caching."""
+        if self._cache_size > 0 and idx in self._cache:
+            return self._cache[idx]
+
+        img_data = load_single_image(self.paths[idx], self.size, self.square_ok)
+        img_data['idx'] = idx
+        img_data['instance'] = str(idx)
+
+        if self._cache_size > 0:
+            # Simple LRU-like cache
+            if len(self._cache) >= self._cache_size:
+                # Remove oldest entry
+                oldest_key = next(iter(self._cache))
+                del self._cache[oldest_key]
+            self._cache[idx] = img_data
+
+        return img_data
+
+    def get_path(self, idx):
+        """Get image path at index."""
+        return self.paths[idx]
+
+    def set_cache_size(self, size):
+        """Set cache size. 0 disables caching."""
+        self._cache_size = size
+        if size == 0:
+            self._cache.clear()
+
+
 def load_images_for_eval(
     folder_or_list, size, square_ok=False, verbose=True, crop=True
 ):

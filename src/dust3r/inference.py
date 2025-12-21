@@ -299,6 +299,130 @@ def inference_recurrent_lighter(groups, model, device, verbose=True):
         res = dict(views=batch, pred=preds)
     return res, state_args
 
+
+@torch.no_grad()
+def inference_recurrent_streaming(groups, model, device, cache_dir, verbose=True, save_interval=100):
+    """
+    Streaming inference that saves results to disk periodically to reduce memory usage.
+
+    Args:
+        groups: Input views (can be lazy loader)
+        model: The model to use
+        device: Device to run on
+        cache_dir: Directory to save intermediate results
+        verbose: Print progress
+        save_interval: Save to disk every N frames
+
+    Returns:
+        metadata dict with poses and paths to cached results, state_args
+    """
+    import os
+    import numpy as np
+    from dust3r.utils.device import to_gpu
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    if verbose:
+        print(f">> Streaming inference on {len(groups)} image/raymaps (saving to {cache_dir})")
+
+    # Storage for lightweight metadata only
+    all_poses = []
+    all_resets = []
+    all_shapes = []
+    chunk_files = []
+
+    # Temporary storage for current chunk
+    chunk_preds = []
+    chunk_views = []
+    chunk_idx = 0
+
+    with torch.amp.autocast('cuda', enabled=False):
+        for frame_idx, pred, view, state_args in model.forward_recurrent_streaming(
+            groups, device, ret_state=True
+        ):
+            # Extract lightweight data
+            if "camera_pose" in pred:
+                all_poses.append(pred["camera_pose"].cpu().clone())
+            all_resets.append(view["reset"].cpu().clone())
+            all_shapes.append(view["true_shape"].cpu().clone())
+
+            # Accumulate for chunk
+            chunk_preds.append(to_cpu(pred))
+            chunk_views.append({
+                "img": view["img"].cpu().clone(),
+                "reset": view["reset"].cpu().clone(),
+                "true_shape": view["true_shape"].cpu().clone(),
+            })
+
+            # Save chunk to disk periodically
+            if len(chunk_preds) >= save_interval or frame_idx == len(groups) - 1:
+                chunk_file = os.path.join(cache_dir, f"chunk_{chunk_idx:04d}.pt")
+                torch.save({
+                    "preds": chunk_preds,
+                    "views": chunk_views,
+                    "start_idx": frame_idx - len(chunk_preds) + 1,
+                    "end_idx": frame_idx,
+                }, chunk_file)
+                chunk_files.append(chunk_file)
+                if verbose:
+                    print(f"  Saved chunk {chunk_idx} (frames {frame_idx - len(chunk_preds) + 1}-{frame_idx})")
+
+                # Clear chunk storage
+                chunk_preds = []
+                chunk_views = []
+                chunk_idx += 1
+
+    metadata = {
+        "poses": all_poses,
+        "resets": all_resets,
+        "shapes": all_shapes,
+        "chunk_files": chunk_files,
+        "total_frames": len(groups),
+        "cache_dir": cache_dir,
+    }
+
+    return metadata, state_args
+
+
+def load_streaming_results(metadata, start_idx=None, end_idx=None):
+    """
+    Load results from streaming cache.
+
+    Args:
+        metadata: Metadata dict from inference_recurrent_streaming
+        start_idx: Start frame index (None for beginning)
+        end_idx: End frame index (None for end)
+
+    Returns:
+        dict with pred and views lists
+    """
+    if start_idx is None:
+        start_idx = 0
+    if end_idx is None:
+        end_idx = metadata["total_frames"]
+
+    all_preds = []
+    all_views = []
+
+    for chunk_file in metadata["chunk_files"]:
+        chunk = torch.load(chunk_file, weights_only=False)
+        chunk_start = chunk["start_idx"]
+        chunk_end = chunk["end_idx"]
+
+        # Skip chunks outside range
+        if chunk_end < start_idx or chunk_start > end_idx:
+            continue
+
+        # Add relevant frames from this chunk
+        for i, (pred, view) in enumerate(zip(chunk["preds"], chunk["views"])):
+            frame_idx = chunk_start + i
+            if start_idx <= frame_idx <= end_idx:
+                all_preds.append(pred)
+                all_views.append(view)
+
+    return {"pred": all_preds, "views": all_views}
+
+
 def check_if_same_size(pairs):
     shapes1 = [img1["img"].shape[-2:] for img1, img2 in pairs]
     shapes2 = [img2["img"].shape[-2:] for img1, img2 in pairs]

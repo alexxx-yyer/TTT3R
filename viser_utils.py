@@ -792,22 +792,30 @@ class PointCloudViewer:
         if set_border_color and edge_color is not None:
             color = self.set_color_border(color[0], color=edge_color)
         if np.isnan(color).any():
-
             color = np.zeros((pred_pts.shape[0], 3))
             color[:, 2] = 1
         else:
             color = color.reshape(-1, 3)
+
+        # Ensure pred_pts and color have the same length
+        min_len = min(len(pred_pts), len(color))
+        pred_pts = pred_pts[:min_len]
+        color = color[:min_len]
+
         if conf is not None:
             conf = conf[0].reshape(-1)
-            pred_pts = pred_pts[conf > self.vis_threshold]
-            color = color[conf > self.vis_threshold]
-        
+            # Ensure conf has the same length
+            conf = conf[:min_len]
+            mask = conf > self.vis_threshold
+            pred_pts = pred_pts[mask]
+            color = color[mask]
+
         # apply downsample
         if downsample_factor > 1 and len(pred_pts) > 0:
             indices = np.arange(0, len(pred_pts), downsample_factor)
             pred_pts = pred_pts[indices]
             color = color[indices]
-            
+
         return pred_pts, color
 
     def add_pc(self, step):
