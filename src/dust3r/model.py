@@ -124,6 +124,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         min_frame_gap=30,
         keyframe_interval=10,
         mem_decay_rate=0.995,
+        # VideoSSM dual-track memory config
+        local_window_size=20,
+        window_size_min=10,
+        window_size_max=50,
+        ssm_state_dim=64,
+        ssm_hidden_dim=128,
+        adaptive_window=True,
         **croco_kwargs,
     ):
         super().__init__()
@@ -152,7 +159,226 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.min_frame_gap = min_frame_gap
         self.keyframe_interval = keyframe_interval
         self.mem_decay_rate = mem_decay_rate
+        # VideoSSM dual-track memory config
+        self.local_window_size = local_window_size
+        self.window_size_min = window_size_min
+        self.window_size_max = window_size_max
+        self.ssm_state_dim = ssm_state_dim
+        self.ssm_hidden_dim = ssm_hidden_dim
+        self.adaptive_window = adaptive_window
         self.croco_kwargs = croco_kwargs
+
+
+class SlidingWindowBuffer(nn.Module):
+    """
+    Sliding window buffer for fast track (local memory).
+    Maintains a fixed-size queue of recent frame features.
+    """
+    def __init__(self, window_size, feat_dim, device=None):
+        super().__init__()
+        self.window_size = window_size
+        self.feat_dim = feat_dim
+        self.device = device
+        # Use a list to store features, will be converted to tensor when needed
+        self.buffer = []
+        
+    def reset(self):
+        """Clear the buffer"""
+        self.buffer = []
+    
+    def add(self, frame_feat):
+        """
+        Add a new frame feature to the buffer.
+        Args:
+            frame_feat: [B, 1, C] or [B, C] frame feature
+        """
+        # Ensure frame_feat is [B, 1, C]
+        if frame_feat.dim() == 2:
+            frame_feat = frame_feat.unsqueeze(1)
+        
+        # Add to buffer
+        self.buffer.append(frame_feat.detach().clone())
+        
+        # Remove oldest if buffer is full
+        if len(self.buffer) > self.window_size:
+            self.buffer.pop(0)
+    
+    def get_window(self):
+        """
+        Get current window content.
+        Returns:
+            [B, L, C] tensor where L is current window size
+        """
+        if len(self.buffer) == 0:
+            return None
+        
+        # Concatenate all frames in buffer
+        window = torch.cat(self.buffer, dim=1)  # [B, L, C]
+        return window
+    
+    def is_full(self):
+        """Check if window is full"""
+        return len(self.buffer) >= self.window_size
+    
+    def get_overflow(self):
+        """
+        Get overflow frame (oldest frame when window is full).
+        Returns:
+            [B, 1, C] tensor or None if no overflow
+        """
+        if len(self.buffer) > self.window_size:
+            return self.buffer[0]
+        return None
+    
+    def resize(self, new_window_size):
+        """Resize the window, keeping the most recent frames"""
+        self.window_size = new_window_size
+        if len(self.buffer) > new_window_size:
+            # Keep only the most recent frames
+            self.buffer = self.buffer[-new_window_size:]
+
+
+class SSMCompressor(nn.Module):
+    """
+    SSM (State Space Model) compressor for slow track (global memory).
+    Compresses overflow information into a fixed-size global state.
+    """
+    def __init__(self, feat_dim, state_dim, hidden_dim):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.state_dim = state_dim
+        self.hidden_dim = hidden_dim
+        
+        # SSM parameters: h_t = A * h_{t-1} + B * x_t, y_t = C * h_t + D * x_t
+        # A: state transition matrix [state_dim, state_dim]
+        # B: input matrix [state_dim, feat_dim]
+        # C: output matrix [feat_dim, state_dim]
+        # D: skip connection [feat_dim, feat_dim]
+        
+        # Initialize A as a learnable diagonal matrix (stable)
+        self.A = nn.Parameter(torch.randn(state_dim, state_dim) * 0.01)
+        # Make A stable by ensuring eigenvalues < 1
+        with torch.no_grad():
+            self.A.data = self.A.data * 0.9
+        
+        self.B = nn.Linear(feat_dim, state_dim, bias=False)
+        self.C = nn.Linear(state_dim, feat_dim, bias=False)
+        self.D = nn.Linear(feat_dim, feat_dim, bias=False)
+        
+        # Layer norm for stability
+        self.norm = nn.LayerNorm(feat_dim)
+        
+    def forward(self, x_seq):
+        """
+        Compress a sequence of features using SSM.
+        Args:
+            x_seq: [B, T, C] sequence of features
+        Returns:
+            [B, state_dim, C] compressed global state
+        """
+        B, T, C = x_seq.shape
+        
+        # Initialize hidden state
+        h = torch.zeros(B, self.state_dim, device=x_seq.device, dtype=x_seq.dtype)
+        
+        # Process sequence through SSM
+        outputs = []
+        for t in range(T):
+            x_t = x_seq[:, t, :]  # [B, C]
+            
+            # State update: h_t = A * h_{t-1} + B * x_t
+            h = torch.matmul(h, self.A.t()) + self.B(x_t)  # [B, state_dim]
+            
+            # Output: y_t = C * h_t + D * x_t
+            y_t = self.C(h) + self.D(x_t)  # [B, C]
+            outputs.append(y_t)
+        
+        # Stack outputs: [B, T, C]
+        output_seq = torch.stack(outputs, dim=1)
+        
+        # Aggregate over time dimension to get compressed state
+        # Use mean pooling with learnable weights
+        compressed = output_seq.mean(dim=1, keepdim=True)  # [B, 1, C]
+        compressed = self.norm(compressed)
+        
+        # Expand to [B, state_dim, C] by repeating and applying transformation
+        compressed = compressed.expand(-1, self.state_dim, -1)  # [B, state_dim, C]
+        
+        return compressed
+
+
+class MemoryFusion(nn.Module):
+    """
+    Attention-based fusion module for combining fast track (local) and slow track (global) memories.
+    Uses cross-attention: local_mem as query, global_mem as key/value.
+    """
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.cross_attn = CrossAttention(
+            dim=dim,
+            rope=None,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.norm_local = nn.LayerNorm(dim)
+        self.norm_global = nn.LayerNorm(dim)
+        
+    def forward(self, local_mem, global_mem, return_attn=False):
+        """
+        Fuse local and global memories using cross-attention.
+        Args:
+            local_mem: [B, L, C] fast track (local) memory
+            global_mem: [B, G, C] slow track (global) memory
+            return_attn: bool, whether to return attention maps
+        Returns:
+            [B, L, C] fused memory
+        """
+        # Normalize
+        local_mem_norm = self.norm_local(local_mem)
+        global_mem_norm = self.norm_global(global_mem)
+        
+        # Cross-attention: query=local, key/value=global
+        # Create dummy positions (not using RoPE here)
+        qpos = None
+        kpos = None
+        
+        if return_attn:
+            fused, attn = self.cross_attn(
+                local_mem_norm, global_mem_norm, global_mem_norm,
+                qpos, kpos, return_attn=True
+            )
+            # Residual connection
+            fused = local_mem + fused
+            return fused, attn
+        else:
+            fused = self.cross_attn(
+                local_mem_norm, global_mem_norm, global_mem_norm,
+                qpos, kpos, return_attn=False
+            )
+            # Residual connection
+            fused = local_mem + fused
+            return fused
+
+
+def compute_adaptive_window_size(seq_len, min_size, max_size):
+    """
+    Compute adaptive window size based on sequence length.
+    Args:
+        seq_len: current sequence length
+        min_size: minimum window size
+        max_size: maximum window size
+    Returns:
+        adaptive window size
+    """
+    if seq_len <= min_size:
+        return min_size
+    elif seq_len >= max_size * 10:
+        return max_size
+    else:
+        # Adaptive: window_size = min(max(min_size, seq_len // 10), max_size)
+        return min(max(min_size, seq_len // 10), max_size)
 
 
 class LocalMemory(nn.Module):
@@ -172,6 +398,13 @@ class LocalMemory(nn.Module):
         norm_layer=nn.LayerNorm,
         norm_mem=True,
         rope=None,
+        # VideoSSM dual-track parameters
+        local_window_size=20,
+        window_size_min=10,
+        window_size_max=50,
+        ssm_state_dim=64,
+        ssm_hidden_dim=128,
+        adaptive_window=True,
     ) -> None:
         super().__init__()
         self.v_dim = v_dim
@@ -182,6 +415,40 @@ class LocalMemory(nn.Module):
         self.mem = nn.Parameter(
             torch.randn(1, size, 2 * v_dim) * 0.2, requires_grad=True
         ) # [1, 256, 1536] pose mem
+        
+        # VideoSSM dual-track components
+        self.local_window_size = local_window_size
+        self.window_size_min = window_size_min
+        self.window_size_max = window_size_max
+        self.adaptive_window = adaptive_window
+        self.current_window_size = local_window_size
+        
+        # Fast track: sliding window buffer
+        self.sliding_window = SlidingWindowBuffer(
+            window_size=local_window_size,
+            feat_dim=2 * v_dim,  # Memory dimension
+        )
+        
+        # Slow track: SSM compressor
+        self.ssm_compressor = SSMCompressor(
+            feat_dim=2 * v_dim,
+            state_dim=ssm_state_dim,
+            hidden_dim=ssm_hidden_dim,
+        )
+        
+        # Global state (slow track output)
+        self.global_state = None  # Will be initialized on first use
+        
+        # Memory fusion module
+        self.memory_fusion = MemoryFusion(
+            dim=2 * v_dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+        )
+        
+        # Original write/read blocks (for final memory bank update)
         self.write_blocks = nn.ModuleList(
             [
                 DecoderBlock(
@@ -218,37 +485,144 @@ class LocalMemory(nn.Module):
                 for _ in range(depth)
             ]
         )
+        
+        # Track sequence length for adaptive window
+        self.seq_len = 0
 
-    def update_mem(self, mem, feat_k, feat_v, decay_rate=1.0, return_attn=False):
+    def reset(self):
+        """Reset all memory components"""
+        self.sliding_window.reset()
+        self.global_state = None
+        self.seq_len = 0
+        self.current_window_size = self.local_window_size
+
+    def update_mem(self, mem, feat_k, feat_v, decay_rate=1.0, return_attn=False, seq_idx=0):
         """
-        Update memory with optional decay mechanism.
+        Update memory using VideoSSM dual-track mechanism.
 
         Args:
-            mem: [B, size, C] current memory
+            mem: [B, size, C] current memory bank
             feat_k: [B, 1, C] global_img_feat (key)
             feat_v: [B, 1, C] out_pose_feat (value)
             decay_rate: float, memory decay rate (0.0-1.0). Default 1.0 means no decay.
             return_attn: bool, whether to return attention maps
+            seq_idx: int, current sequence index (for adaptive window)
 
         Returns:
             mem: [B, size, C] updated memory
         """
-        # Apply memory decay to reduce accumulation of old errors
+        B = mem.shape[0]
+        self.seq_len = seq_idx + 1
+        
+        # Compute adaptive window size if enabled
+        if self.adaptive_window:
+            new_window_size = compute_adaptive_window_size(
+                self.seq_len, self.window_size_min, self.window_size_max
+            )
+            if new_window_size != self.current_window_size:
+                self.sliding_window.resize(new_window_size)
+                self.current_window_size = new_window_size
+        
+        # Prepare feature for fast track: [B, 1, 2*v_dim]
+        feat_k_proj = self.proj_q(feat_k)  # [B, 1, v_dim]
+        frame_feat = torch.cat([feat_k_proj, feat_v], dim=-1)  # [B, 1, 2*v_dim]
+        
+        # Add to sliding window (fast track)
+        self.sliding_window.add(frame_feat)
+        
+        # Get current window (fast track)
+        local_mem = self.sliding_window.get_window()  # [B, L, 2*v_dim] or None
+        
+        # Handle overflow: compress to global state (slow track)
+        overflow_frame = self.sliding_window.get_overflow()
+        if overflow_frame is not None:
+            # Initialize global state if needed
+            if self.global_state is None:
+                # Initialize with first overflow frame
+                self.global_state = self.ssm_compressor(
+                    overflow_frame.unsqueeze(1)  # [B, 1, 2*v_dim] -> [B, 1, 2*v_dim]
+                )  # [B, ssm_state_dim, 2*v_dim]
+            else:
+                # Compress overflow frame and update global state
+                overflow_compressed = self.ssm_compressor(
+                    overflow_frame.unsqueeze(1)
+                )  # [B, ssm_state_dim, 2*v_dim]
+                # Update global state (weighted average with decay)
+                self.global_state = (
+                    self.global_state * decay_rate + 
+                    overflow_compressed * (1 - decay_rate)
+                )
+        
+        # Fuse fast and slow tracks using attention
+        if local_mem is not None:
+            if self.global_state is not None and local_mem.shape[1] > 0:
+                # Both tracks available: fuse them
+                fused_mem = self.memory_fusion(
+                    local_mem, self.global_state, return_attn=return_attn
+                )  # [B, L, 2*v_dim]
+                
+                # Pad or truncate to match memory bank size
+                target_size = mem.shape[1]
+                if fused_mem.shape[1] < target_size:
+                    # Pad with zeros
+                    padding = torch.zeros(
+                        B, target_size - fused_mem.shape[1], 2 * self.v_dim,
+                        device=fused_mem.device, dtype=fused_mem.dtype
+                    )
+                    fused_mem = torch.cat([fused_mem, padding], dim=1)
+                elif fused_mem.shape[1] > target_size:
+                    # Truncate (keep most recent)
+                    fused_mem = fused_mem[:, -target_size:, :]
+                
+                # Use fused memory as input to write blocks
+                mem_input = fused_mem
+            else:
+                # Only fast track available: use it directly
+                # Pad or truncate to match memory bank size
+                target_size = mem.shape[1]
+                if local_mem.shape[1] < target_size:
+                    padding = torch.zeros(
+                        B, target_size - local_mem.shape[1], 2 * self.v_dim,
+                        device=local_mem.device, dtype=local_mem.dtype
+                    )
+                    mem_input = torch.cat([local_mem, padding], dim=1)
+                elif local_mem.shape[1] > target_size:
+                    mem_input = local_mem[:, -target_size:, :]
+                else:
+                    mem_input = local_mem
+        else:
+            # No local memory yet: use current frame
+            mem_input = frame_feat.expand(-1, mem.shape[1], -1)
+        
+        # Apply memory decay to existing memory
         if decay_rate < 1.0:
             mem = mem * decay_rate
-
-        feat_k = self.proj_q(feat_k)  # [B, 1, C]
-        feat = torch.cat([feat_k, feat_v], dim=-1)
-
+        
+        # Blend fused memory with existing memory bank
+        # Use fused memory to update the memory bank
+        if mem_input.shape[1] == mem.shape[1]:
+            # Replace memory bank with fused memory (weighted update)
+            mem = mem * 0.5 + mem_input * 0.5
+        
+        # Update memory bank using write blocks
+        # Prepare input: concatenate current frame feature with memory
+        feat = torch.cat([feat_k_proj, feat_v], dim=-1)  # [B, 1, 2*v_dim]
+        
         attention_maps = []
         for blk in self.write_blocks:
-            mem, _, self_attn, cross_attn = blk(mem, feat, None, None, return_attn=return_attn)
+            mem, _, self_attn, cross_attn = blk(
+                mem, feat, None, None, return_attn=return_attn
+            )
             attention_maps.append((self_attn, cross_attn))
+        
         return mem
 
     def inquire(self, query, mem, return_attn=False):
-        x = self.proj_q(query)  # [B, 1, C]
-        x = torch.cat([x, self.masked_token.expand(x.shape[0], -1, -1)], dim=-1) # [1, 1, 768 global_img_feat_i + 768 masked_token(pose)]
+        """
+        Query memory (interface unchanged for compatibility).
+        """
+        x = self.proj_q(query)  # [B, 1, v_dim]
+        x = torch.cat([x, self.masked_token.expand(x.shape[0], -1, -1)], dim=-1) # [1, 1, 2*v_dim]
         attention_maps = []
         for blk in self.read_blocks:
             x, _, self_attn, cross_attn = blk(x, mem, None, None, return_attn=return_attn)
@@ -518,6 +892,13 @@ class ARCroco3DStereo(CroCoNet):
                 attn_drop=0.0,
                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
                 rope=None,
+                # VideoSSM dual-track parameters
+                local_window_size=config.local_window_size,
+                window_size_min=config.window_size_min,
+                window_size_max=config.window_size_max,
+                ssm_state_dim=config.ssm_state_dim,
+                ssm_hidden_dim=config.ssm_hidden_dim,
+                adaptive_window=config.adaptive_window,
             )
             # Loop closure components (inference only)
             self.keyframe_db = KeyframeDatabase(
@@ -534,6 +915,8 @@ class ARCroco3DStereo(CroCoNet):
                 mem_dim=self.dec_embed_dim * 2,  # mem is 2*v_dim
                 pose_dim=7,
             )
+            # Store loop closure information for visualization
+            self.loop_closures = []  # List of (current_idx, matched_idx, confidence, current_img, matched_img)
         self.register_tokens = nn.Embedding(config.state_size, self.enc_embed_dim) # init state tokens [768, 1024]
         self.state_size = config.state_size
         self.state_pe = config.state_pe
@@ -1062,7 +1445,7 @@ class ARCroco3DStereo(CroCoNet):
         _enable_lc = getattr(self.config, 'enable_loop_closure', False)
         decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
         new_mem = self.pose_retriever.update_mem(
-            mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
+            mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate, seq_idx=i
         )
         head_input = [
             dec[0].float(),
@@ -1087,6 +1470,10 @@ class ARCroco3DStereo(CroCoNet):
             reset_mask = reset_mask[:, None, None].float()
             state_feat = init_state_feat * reset_mask + state_feat * (1 - reset_mask)
             mem = init_mem * reset_mask + mem * (1 - reset_mask)
+            # Reset dual-track memory if reset is triggered
+            if reset_mask.any():
+                if self.pose_head_flag:
+                    self.pose_retriever.reset()
         return res, (state_feat, mem)
 
     # training and testing
@@ -1134,7 +1521,7 @@ class ARCroco3DStereo(CroCoNet):
             _enable_lc = getattr(self.config, 'enable_loop_closure', False)
             decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
             new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
+                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate, seq_idx=i
             ) # [1, 256, 1536] use mem as query, cross-attend [global_img_feat_i, out_pose_feat_i], get new_mem
             assert len(dec) == self.dec_depth + 1
             head_input = [
@@ -1182,6 +1569,9 @@ class ARCroco3DStereo(CroCoNet):
                     1 - reset_mask
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
+                # Reset dual-track memory if reset is triggered
+                if reset_mask.any() and self.pose_head_flag:
+                    self.pose_retriever.reset()
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
             )
@@ -1250,7 +1640,7 @@ class ARCroco3DStereo(CroCoNet):
         _enable_lc = getattr(self.config, 'enable_loop_closure', False)
         decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
         new_mem = self.pose_retriever.update_mem(
-            mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
+            mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate, seq_idx=0
         )
         assert len(dec) == self.dec_depth + 1
         head_input = [
@@ -1332,6 +1722,9 @@ class ARCroco3DStereo(CroCoNet):
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                # Reset dual-track memory at sequence start
+                if self.pose_head_flag:
+                    self.pose_retriever.reset()
                 all_state_args.append(
                     (state_feat, state_pos, init_state_feat, mem, init_mem)
                 )
@@ -1365,7 +1758,7 @@ class ARCroco3DStereo(CroCoNet):
             _enable_lc = getattr(self.config, 'enable_loop_closure', False)
             decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
             new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
+                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate, seq_idx=i
             )
             assert len(dec) == self.dec_depth + 1
             head_input = [
@@ -1398,6 +1791,9 @@ class ARCroco3DStereo(CroCoNet):
                     1 - reset_mask
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
+                # Reset dual-track memory if reset is triggered
+                if reset_mask.any() and self.pose_head_flag:
+                    self.pose_retriever.reset()
             all_state_args.append(
                 (state_feat, state_pos, init_state_feat, mem, init_mem)
             )
@@ -1406,6 +1802,9 @@ class ARCroco3DStereo(CroCoNet):
         return ress, views
 
     def forward_recurrent_lighter(self, views, device='cuda', ret_state=False):
+        # Reset loop closures list for new sequence
+        if hasattr(self, 'loop_closures'):
+            self.loop_closures = []
         ress = []
         all_state_args = []
         reset_mask = False
@@ -1479,6 +1878,9 @@ class ARCroco3DStereo(CroCoNet):
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                # Reset dual-track memory at sequence start
+                if self.pose_head_flag:
+                    self.pose_retriever.reset()
                 # Initialize keyframe database for loop closure
                 if _enable_lc and self.pose_head_flag:
                     self.keyframe_db.reset(feat_i.shape[0], device=feat_i.device)
@@ -1513,7 +1915,7 @@ class ARCroco3DStereo(CroCoNet):
             # update mem with optional decay
             decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
             new_mem = self.pose_retriever.update_mem(
-                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate
+                mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate, seq_idx=i
             )
 
             assert len(dec) == self.dec_depth + 1
@@ -1540,6 +1942,21 @@ class ARCroco3DStereo(CroCoNet):
                             current_pose, loop_pose,
                             confidence * loop_detected.float()
                         )
+                        
+                        # Store loop closure information for visualization
+                        if hasattr(self, 'loop_closures'):
+                            # Get current frame image from view
+                            current_img = view.get("img", None)
+                            
+                            conf_val = confidence.item() if isinstance(confidence, torch.Tensor) else confidence
+                            frame_id_val = loop_frame_id.item() if isinstance(loop_frame_id, torch.Tensor) else loop_frame_id
+                            
+                            self.loop_closures.append({
+                                'current_idx': i,
+                                'matched_idx': int(frame_id_val),
+                                'confidence': float(conf_val),
+                                'current_img': current_img,  # Store reference, will load from paths in demo
+                            })
 
                     # Add keyframe at fixed intervals
                     _kf_interval = getattr(self.config, 'keyframe_interval', 10)
@@ -1590,6 +2007,9 @@ class ARCroco3DStereo(CroCoNet):
                     1 - reset_mask
                 )
                 mem = init_mem * reset_mask + mem * (1 - reset_mask)
+                # Reset dual-track memory if reset is triggered
+                if reset_mask.any() and self.pose_head_flag:
+                    self.pose_retriever.reset()
 
         if ret_state:
             return ress, views, all_state_args
@@ -1664,6 +2084,9 @@ class ARCroco3DStereo(CroCoNet):
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                # Reset dual-track memory at sequence start
+                if self.pose_head_flag:
+                    self.pose_retriever.reset()
                 if _enable_lc and self.pose_head_flag:
                     self.keyframe_db.reset(feat_i.shape[0], device=feat_i.device)
 
@@ -1686,7 +2109,7 @@ class ARCroco3DStereo(CroCoNet):
             out_pose_feat_i = dec[-1][:, 0:1]
 
             decay_rate = getattr(self.config, 'mem_decay_rate', 1.0) if _enable_lc else 1.0
-            new_mem = self.pose_retriever.update_mem(mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate)
+            new_mem = self.pose_retriever.update_mem(mem, global_img_feat_i, out_pose_feat_i, decay_rate=decay_rate, seq_idx=i)
 
             assert len(dec) == self.dec_depth + 1
             head_input = [
@@ -1753,6 +2176,9 @@ class ARCroco3DStereo(CroCoNet):
                 reset_mask_float = reset_mask[:, None, None].float()
                 state_feat = init_state_feat * reset_mask_float + state_feat * (1 - reset_mask_float)
                 mem = init_mem * reset_mask_float + mem * (1 - reset_mask_float)
+                # Reset dual-track memory if reset is triggered
+                if reset_mask_float.any() and self.pose_head_flag:
+                    self.pose_retriever.reset()
 
 
 if __name__ == "__main__":

@@ -713,6 +713,147 @@ def save_pointclouds(pts3ds_list, colors_list, conf_list, output_dir, conf_thres
     return combined_ply_path
 
 
+def visualize_loop_closure(current_frame_idx, matched_frame_idx, current_img, matched_img, 
+                          confidence, output_dir, loop_count=0):
+    """
+    Visualize loop closure detection result.
+    
+    Args:
+        current_frame_idx: Current frame index
+        matched_frame_idx: Matched keyframe index
+        current_img: Current frame image (numpy array or tensor)
+        matched_img: Matched keyframe image (numpy array or tensor)
+        confidence: Detection confidence score
+        output_dir: Output directory
+        loop_count: Loop closure count (for naming)
+    """
+    import cv2
+    import numpy as np
+    
+    # Convert to numpy if needed
+    if isinstance(current_img, torch.Tensor):
+        current_img = current_img.cpu().numpy()
+    if isinstance(matched_img, torch.Tensor):
+        matched_img = matched_img.cpu().numpy()
+    
+    # Normalize to [0, 255] if needed
+    if current_img.max() <= 1.0:
+        current_img = (current_img * 255).astype(np.uint8)
+    if matched_img.max() <= 1.0:
+        matched_img = (matched_img * 255).astype(np.uint8)
+    
+    # Handle different image formats
+    if len(current_img.shape) == 4:  # [B, C, H, W]
+        current_img = current_img[0].transpose(1, 2, 0)
+    if len(matched_img.shape) == 4:
+        matched_img = matched_img[0].transpose(1, 2, 0)
+    
+    if len(current_img.shape) == 3 and current_img.shape[0] == 3:  # [C, H, W]
+        current_img = current_img.transpose(1, 2, 0)
+    if len(matched_img.shape) == 3 and matched_img.shape[0] == 3:
+        matched_img = matched_img.transpose(1, 2, 0)
+    
+    # Convert RGB to BGR for OpenCV if needed
+    if current_img.shape[2] == 3:
+        current_img = cv2.cvtColor(current_img, cv2.COLOR_RGB2BGR)
+    if matched_img.shape[2] == 3:
+        matched_img = cv2.cvtColor(matched_img, cv2.COLOR_RGB2BGR)
+    
+    # Resize to same height if needed
+    h1, w1 = current_img.shape[:2]
+    h2, w2 = matched_img.shape[:2]
+    if h1 != h2:
+        scale = h1 / h2
+        new_w2 = int(w2 * scale)
+        matched_img = cv2.resize(matched_img, (new_w2, h1))
+    
+    # Create side-by-side comparison
+    comparison = np.hstack([current_img, matched_img])
+    
+    # Add text annotations
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(comparison, f'Current Frame: {current_frame_idx}', 
+                (10, 30), font, 1, (0, 255, 0), 2)
+    cv2.putText(comparison, f'Matched Frame: {matched_frame_idx}', 
+                (w1 + 10, 30), font, 1, (0, 255, 0), 2)
+    cv2.putText(comparison, f'Confidence: {confidence:.3f}', 
+                (10, h1 - 20), font, 0.8, (0, 255, 255), 2)
+    cv2.putText(comparison, f'Frame Gap: {current_frame_idx - matched_frame_idx}', 
+                (w1 + 10, h1 - 20), font, 0.8, (0, 255, 255), 2)
+    
+    # Save image
+    os.makedirs(os.path.join(output_dir, "loop_closures"), exist_ok=True)
+    save_path = os.path.join(output_dir, "loop_closures", 
+                            f"loop_{loop_count:04d}_frame_{current_frame_idx}_match_{matched_frame_idx}.png")
+    cv2.imwrite(save_path, comparison)
+    
+    return save_path
+
+
+def visualize_trajectory(poses, loop_pairs, output_dir):
+    """
+    Visualize camera trajectory with loop closures.
+    
+    Args:
+        poses: List of camera poses (4x4 matrices or [tx, ty, tz, qw, qx, qy, qz])
+        loop_pairs: List of (current_idx, matched_idx, confidence) tuples
+        output_dir: Output directory
+    """
+    import matplotlib.pyplot as plt
+    from scipy.spatial.transform import Rotation as R
+    
+    # Extract positions
+    positions = []
+    for pose in poses:
+        if isinstance(pose, np.ndarray) and pose.shape == (4, 4):
+            pos = pose[:3, 3]
+        elif isinstance(pose, torch.Tensor) and pose.shape == (4, 4):
+            pos = pose[:3, 3].cpu().numpy()
+        elif len(pose) == 7:  # [tx, ty, tz, qw, qx, qy, qz]
+            pos = np.array(pose[:3])
+        else:
+            continue
+        positions.append(pos)
+    
+    if len(positions) == 0:
+        return
+    
+    positions = np.array(positions)
+    
+    # Create trajectory plot
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Plot trajectory
+    ax.plot(positions[:, 0], positions[:, 2], 'b-', alpha=0.6, linewidth=2, label='Trajectory')
+    ax.scatter(positions[0, 0], positions[0, 2], c='green', s=100, marker='o', 
+               label='Start', zorder=5)
+    ax.scatter(positions[-1, 0], positions[-1, 2], c='red', s=100, marker='s', 
+               label='End', zorder=5)
+    
+    # Plot loop closures
+    for current_idx, matched_idx, confidence in loop_pairs:
+        if current_idx < len(positions) and matched_idx < len(positions):
+            ax.plot([positions[current_idx, 0], positions[matched_idx, 0]],
+                   [positions[current_idx, 2], positions[matched_idx, 2]],
+                   'r--', alpha=0.5, linewidth=1.5)
+            ax.scatter(positions[current_idx, 0], positions[current_idx, 2],
+                      c='orange', s=50, marker='*', zorder=4)
+    
+    ax.set_xlabel('X (m)', fontsize=12)
+    ax.set_ylabel('Z (m)', fontsize=12)
+    ax.set_title('Camera Trajectory with Loop Closures', fontsize=14)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    
+    # Save plot
+    save_path = os.path.join(output_dir, 'loop_closure_trajectory.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return save_path
+
+
 def run_inference(args):
     """
     Execute the full inference and visualization pipeline.
@@ -741,6 +882,9 @@ def run_inference(args):
         return
 
     print(f"Found {len(img_paths)} images in {args.seq_path}.")
+    
+    # Store img_paths for loop closure visualization
+    original_img_paths = img_paths.copy() if isinstance(img_paths, list) else img_paths
 
     # Prepare input views (lazy or eager loading).
     if args.lazy_load:
@@ -802,6 +946,9 @@ def run_inference(args):
         pts3ds_other, colors, conf, cam_dict = prepare_output(
             outputs, args.output_dir, 1, True
         )
+        
+        # Note: Loop closure visualization will be handled after this block
+        # since we need colors_to_vis which is created later
 
         # Clean up cache after processing
         print("Cleaning up inference cache...")
@@ -827,6 +974,90 @@ def run_inference(args):
     colors_to_vis = [c.cpu().numpy() for c in colors]
     edge_colors = [None] * len(pts3ds_to_vis)
 
+    # Visualize loop closures if detected
+    if hasattr(model, 'loop_closures') and len(model.loop_closures) > 0:
+        print(f"\nFound {len(model.loop_closures)} loop closure(s). Visualizing...")
+        loop_count = 0
+        loop_pairs = []
+        
+        for loop_info in model.loop_closures:
+            current_idx = loop_info['current_idx']
+            matched_idx = loop_info['matched_idx']
+            confidence = loop_info['confidence']
+            
+            # Load current frame image
+            current_img = None
+            if current_idx < len(colors_to_vis):
+                current_img = colors_to_vis[current_idx]
+            else:
+                # Try to load from saved color images
+                color_path = os.path.join(args.output_dir, "color", f"{current_idx:06d}.png")
+                if os.path.exists(color_path):
+                    current_img = cv2.imread(color_path)
+                    current_img = cv2.cvtColor(current_img, cv2.COLOR_BGR2RGB) / 255.0
+                else:
+                    # Try to load from original image paths
+                    if current_idx < len(original_img_paths):
+                        from src.dust3r.utils.image import load_images
+                        matched_img_data = load_images([original_img_paths[current_idx]], size=args.size)
+                        if matched_img_data:
+                            current_img = matched_img_data[0]["img"]
+                            if isinstance(current_img, torch.Tensor):
+                                current_img = current_img.permute(1, 2, 0).cpu().numpy()
+                            current_img = 0.5 * (current_img + 1.0)  # Denormalize
+            
+            if current_img is None:
+                print(f"Warning: Could not load image for frame {current_idx}")
+                continue
+            
+            # Load matched frame image
+            matched_img = None
+            if matched_idx < len(colors_to_vis):
+                matched_img = colors_to_vis[matched_idx]
+            else:
+                # Try to load from saved color images
+                color_path = os.path.join(args.output_dir, "color", f"{matched_idx:06d}.png")
+                if os.path.exists(color_path):
+                    matched_img = cv2.imread(color_path)
+                    matched_img = cv2.cvtColor(matched_img, cv2.COLOR_BGR2RGB) / 255.0
+                else:
+                    # Try to load from original image paths
+                    if matched_idx < len(original_img_paths):
+                        from src.dust3r.utils.image import load_images
+                        matched_img_data = load_images([original_img_paths[matched_idx]], size=args.size)
+                        if matched_img_data:
+                            matched_img = matched_img_data[0]["img"]
+                            if isinstance(matched_img, torch.Tensor):
+                                matched_img = matched_img.permute(1, 2, 0).cpu().numpy()
+                            matched_img = 0.5 * (matched_img + 1.0)  # Denormalize
+            
+            if matched_img is not None:
+                visualize_loop_closure(
+                    current_idx, matched_idx, current_img, matched_img,
+                    confidence, args.output_dir, loop_count
+                )
+                loop_pairs.append((current_idx, matched_idx, confidence))
+                loop_count += 1
+                print(f"  Saved loop closure visualization: frame {current_idx} <-> frame {matched_idx} (confidence: {confidence:.3f})")
+        
+        # Visualize trajectory if we have camera poses
+        if len(loop_pairs) > 0 and 'R' in cam_dict and 't' in cam_dict:
+            try:
+                # Reconstruct poses from R and t
+                poses = []
+                for i in range(len(cam_dict['R'])):
+                    R = cam_dict['R'][i]
+                    t = cam_dict['t'][i]
+                    pose = np.eye(4)
+                    pose[:3, :3] = R
+                    pose[:3, 3] = t
+                    poses.append(pose)
+                
+                visualize_trajectory(poses, loop_pairs, args.output_dir)
+                print(f"  Saved trajectory visualization: {args.output_dir}/loop_closure_trajectory.png")
+            except Exception as e:
+                print(f"  Warning: Could not visualize trajectory: {e}")
+    
     # Save point clouds as PLY files if requested
     if args.save_ply:
         print("\nSaving point clouds...")
