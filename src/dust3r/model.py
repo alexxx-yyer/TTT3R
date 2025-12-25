@@ -181,10 +181,12 @@ class SlidingWindowBuffer(nn.Module):
         self.device = device
         # Use a list to store features, will be converted to tensor when needed
         self.buffer = []
-        
+        self._overflow = None  # Store overflow frame before popping
+
     def reset(self):
         """Clear the buffer"""
         self.buffer = []
+        self._overflow = None
     
     def add(self, frame_feat):
         """
@@ -195,13 +197,14 @@ class SlidingWindowBuffer(nn.Module):
         # Ensure frame_feat is [B, 1, C]
         if frame_feat.dim() == 2:
             frame_feat = frame_feat.unsqueeze(1)
-        
+
         # Add to buffer
         self.buffer.append(frame_feat.detach().clone())
-        
-        # Remove oldest if buffer is full
+
+        # Save overflow frame before popping
+        self._overflow = None
         if len(self.buffer) > self.window_size:
-            self.buffer.pop(0)
+            self._overflow = self.buffer.pop(0)
     
     def get_window(self):
         """
@@ -222,13 +225,11 @@ class SlidingWindowBuffer(nn.Module):
     
     def get_overflow(self):
         """
-        Get overflow frame (oldest frame when window is full).
+        Get overflow frame (oldest frame that was popped when buffer exceeded window_size).
         Returns:
             [B, 1, C] tensor or None if no overflow
         """
-        if len(self.buffer) > self.window_size:
-            return self.buffer[0]
-        return None
+        return self._overflow
     
     def resize(self, new_window_size):
         """Resize the window, keeping the most recent frames"""
@@ -534,22 +535,19 @@ class LocalMemory(nn.Module):
         local_mem = self.sliding_window.get_window()  # [B, L, 2*v_dim] or None
         
         # Handle overflow: compress to global state (slow track)
-        overflow_frame = self.sliding_window.get_overflow()
+        overflow_frame = self.sliding_window.get_overflow()  # [B, 1, 2*v_dim] or None
         if overflow_frame is not None:
             # Initialize global state if needed
             if self.global_state is None:
                 # Initialize with first overflow frame
-                self.global_state = self.ssm_compressor(
-                    overflow_frame.unsqueeze(1)  # [B, 1, 2*v_dim] -> [B, 1, 2*v_dim]
-                )  # [B, ssm_state_dim, 2*v_dim]
+                # overflow_frame is already [B, 1, 2*v_dim], which matches SSMCompressor input [B, T, C]
+                self.global_state = self.ssm_compressor(overflow_frame)  # [B, ssm_state_dim, 2*v_dim]
             else:
                 # Compress overflow frame and update global state
-                overflow_compressed = self.ssm_compressor(
-                    overflow_frame.unsqueeze(1)
-                )  # [B, ssm_state_dim, 2*v_dim]
+                overflow_compressed = self.ssm_compressor(overflow_frame)  # [B, ssm_state_dim, 2*v_dim]
                 # Update global state (weighted average with decay)
                 self.global_state = (
-                    self.global_state * decay_rate + 
+                    self.global_state * decay_rate +
                     overflow_compressed * (1 - decay_rate)
                 )
         
