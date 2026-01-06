@@ -113,6 +113,29 @@ def parse_args():
         default=1,
         help="Downsample factor for the point cloud viewer",
     )
+    parser.add_argument(
+        "--use_keyframe_memory_bank",
+        action="store_true",
+        help="Enable Keyframe Memory Bank mechanism",
+    )
+    parser.add_argument(
+        "--keyframe_memory_lambda_time",
+        type=float,
+        default=0.1,
+        help="Weight for time similarity in hybrid similarity calculation",
+    )
+    parser.add_argument(
+        "--keyframe_memory_top_k",
+        type=int,
+        default=5,
+        help="Number of top-k keyframes to retrieve from Memory Bank",
+    )
+    parser.add_argument(
+        "--keyframe_memory_max_size",
+        type=int,
+        default=None,
+        help="Maximum size of Keyframe Memory Bank (None for unlimited)",
+    )
     return parser.parse_args()
 
 
@@ -463,6 +486,22 @@ def run_inference(args):
     print(f"Loading model from {args.model_path}...")
     model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
     model.config.model_update_type = args.model_update_type
+    
+    # Set Keyframe Memory Bank parameters
+    model.config.use_keyframe_memory_bank = args.use_keyframe_memory_bank
+    model.config.keyframe_memory_lambda_time = args.keyframe_memory_lambda_time
+    model.config.keyframe_memory_top_k = args.keyframe_memory_top_k
+    model.config.keyframe_memory_max_size = args.keyframe_memory_max_size
+    
+    # Initialize Keyframe Memory Bank if enabled
+    if args.use_keyframe_memory_bank:
+        from src.dust3r.model import KeyframeMemoryBank
+        model.keyframe_memory_bank = KeyframeMemoryBank(
+            max_size=args.keyframe_memory_max_size,
+            device=device
+        )
+        print(f"Keyframe Memory Bank enabled: lambda_time={args.keyframe_memory_lambda_time}, "
+              f"top_k={args.keyframe_memory_top_k}, max_size={args.keyframe_memory_max_size}")
 
     model.eval()
 

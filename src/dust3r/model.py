@@ -117,6 +117,10 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         pose_conf_head=False,
         pose_head=False,
         model_update_type="cut3r",
+        use_keyframe_memory_bank=False,
+        keyframe_memory_lambda_time=0.1,
+        keyframe_memory_top_k=5,
+        keyframe_memory_max_size=None,
         **croco_kwargs,
     ):
         super().__init__()
@@ -138,6 +142,10 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
         self.model_update_type = model_update_type
+        self.use_keyframe_memory_bank = use_keyframe_memory_bank
+        self.keyframe_memory_lambda_time = keyframe_memory_lambda_time
+        self.keyframe_memory_top_k = keyframe_memory_top_k
+        self.keyframe_memory_max_size = keyframe_memory_max_size
         self.croco_kwargs = croco_kwargs
 
 
@@ -230,6 +238,219 @@ class LocalMemory(nn.Module):
             attention_maps.append((self_attn, cross_attn))
         return x[..., -self.v_dim :]
 
+    def inquire_with_keyframes(self, query, mem, keyframe_features=None, return_attn=False):
+        """
+        Enhanced inquire method that can use keyframe features from Memory Bank.
+        
+        Args:
+            query: [B, 1, C] query feature
+            mem: [B, size, 2*C] memory
+            keyframe_features: Optional [B, K, 2*C] keyframe features from Memory Bank
+            return_attn: Whether to return attention maps
+        """
+        x = self.proj_q(query)  # [B, 1, C]
+        x = torch.cat([x, self.masked_token.expand(x.shape[0], -1, -1)], dim=-1) # [B, 1, 2*C]
+        
+        # If keyframe features are provided, concatenate them with mem
+        if keyframe_features is not None:
+            # keyframe_features: [B, K, 2*C], mem: [B, size, 2*C]
+            enhanced_mem = torch.cat([mem, keyframe_features], dim=1)  # [B, size+K, 2*C]
+        else:
+            enhanced_mem = mem
+        
+        attention_maps = []
+        for blk in self.read_blocks:
+            x, _, self_attn, cross_attn = blk(x, enhanced_mem, None, None, return_attn=return_attn)
+            attention_maps.append((self_attn, cross_attn))
+        return x[..., -self.v_dim :]
+
+
+class KeyframeMemoryBank:
+    """
+    Keyframe Memory Bank for storing and retrieving keyframe features.
+    
+    Stores global image features and pose features with timestamps,
+    and provides similarity-based retrieval using cosine and time similarity.
+    """
+    
+    def __init__(self, max_size=None, device='cuda'):
+        """
+        Initialize the Keyframe Memory Bank.
+        
+        Args:
+            max_size: Maximum number of keyframes to store (None for unlimited)
+            device: Device to store tensors on
+        """
+        self.max_size = max_size
+        self.device = device
+        self.features = []  # List of [B, 1, C] tensors
+        self.pose_features = []  # List of [B, 1, C] tensors
+        self.timestamps = []  # List of frame indices
+        self.size = 0
+    
+    def add(self, frame_idx, global_feat, pose_feat):
+        """
+        Add a keyframe to the memory bank.
+        
+        Args:
+            frame_idx: Frame index (timestamp)
+            global_feat: [B, 1, C] global image feature
+            pose_feat: [B, 1, C] pose feature
+        """
+        # Move to device if needed
+        global_feat = global_feat.to(self.device)
+        pose_feat = pose_feat.to(self.device)
+        
+        self.features.append(global_feat.detach().clone())
+        self.pose_features.append(pose_feat.detach().clone())
+        self.timestamps.append(frame_idx)
+        self.size += 1
+        
+        # If max_size is set and exceeded, remove oldest frame (FIFO)
+        if self.max_size is not None and self.size > self.max_size:
+            self.features.pop(0)
+            self.pose_features.pop(0)
+            self.timestamps.pop(0)
+            self.size -= 1
+    
+    def compute_cosine_similarity(self, query_feat, bank_feat):
+        """
+        Compute cosine similarity between query feature and bank feature.
+        
+        Formula: sim_cos = sum_p (F_i_p · X_hat_p^T) / (||F_i_p|| · ||X_hat_p||)
+        
+        Args:
+            query_feat: [B, 1, C] query feature
+            bank_feat: [B, 1, C] bank feature
+            
+        Returns:
+            [B, 1] cosine similarity scores
+        """
+        # Normalize features
+        query_norm = F.normalize(query_feat, p=2, dim=-1)  # [B, 1, C]
+        bank_norm = F.normalize(bank_feat, p=2, dim=-1)  # [B, 1, C]
+        
+        # Compute cosine similarity: dot product of normalized features
+        # Sum over feature dimension p
+        cosine_sim = (query_norm * bank_norm).sum(dim=-1, keepdim=True)  # [B, 1, 1]
+        return cosine_sim.squeeze(-1)  # [B, 1]
+    
+    def compute_time_similarity(self, query_time, bank_time):
+        """
+        Compute time similarity using Gaussian decay.
+        
+        Formula: sim_time = exp(-(time(F_i) - time(X_hat))^2)
+        
+        Args:
+            query_time: Scalar or tensor query timestamp
+            bank_time: Scalar or tensor bank timestamp
+            
+        Returns:
+            Time similarity score (scalar or tensor)
+        """
+        time_diff = query_time - bank_time
+        time_sim = torch.exp(-(time_diff ** 2))
+        return time_sim
+    
+    def compute_hybrid_similarity(self, query_feat, query_time, lambda_time):
+        """
+        Compute hybrid similarity for all keyframes in the bank.
+        
+        Formula: sim_hybrid = sim_cos + lambda_time * sim_time
+        
+        Args:
+            query_feat: [B, 1, C] query feature
+            query_time: Scalar query timestamp (frame index)
+            lambda_time: Weight for time similarity
+            
+        Returns:
+            List of [B, 1] hybrid similarity scores for each keyframe
+        """
+        if self.size == 0:
+            return []
+        
+        similarities = []
+        for i in range(self.size):
+            # Compute cosine similarity
+            cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])  # [B, 1]
+            
+            # Compute time similarity
+            time_sim = self.compute_time_similarity(query_time, self.timestamps[i])
+            # Ensure time_sim has same shape as cos_sim
+            if isinstance(time_sim, torch.Tensor):
+                time_sim = time_sim.unsqueeze(-1) if time_sim.dim() == 0 else time_sim
+            else:
+                time_sim = torch.tensor(time_sim, device=query_feat.device).unsqueeze(-1)
+            
+            # Compute hybrid similarity
+            hybrid_sim = cos_sim + lambda_time * time_sim
+            similarities.append(hybrid_sim)
+        
+        return similarities
+    
+    def retrieve_top_k(self, query_feat, query_time, k, lambda_time):
+        """
+        Retrieve top-k most similar keyframes from the memory bank.
+        
+        Args:
+            query_feat: [B, 1, C] query feature
+            query_time: Scalar query timestamp (frame index)
+            k: Number of top keyframes to retrieve
+            lambda_time: Weight for time similarity
+            
+        Returns:
+            keyframe_features: [B, K, 2*C] concatenated [global_feat, pose_feat] for top-k keyframes
+            indices: List of indices of top-k keyframes
+        """
+        if self.size == 0:
+            return None, []
+        
+        # Compute hybrid similarities for all keyframes
+        similarities = self.compute_hybrid_similarity(query_feat, query_time, lambda_time)
+        
+        if len(similarities) == 0:
+            return None, []
+        
+        # Stack similarities: [size, B, 1]
+        sim_stack = torch.stack(similarities, dim=0)  # [size, B, 1]
+        sim_stack = sim_stack.squeeze(-1)  # [size, B]
+        
+        # Get top-k indices (along the size dimension)
+        # For batch processing, we take top-k for each batch item
+        # But typically B=1, so we can simplify
+        # Take top-k for the first (and typically only) batch item
+        top_k_values, top_k_indices = torch.topk(sim_stack[:, 0], k=min(k, self.size), dim=0)
+        top_k_indices = top_k_indices.cpu().tolist()
+        if not isinstance(top_k_indices, list):
+            top_k_indices = [top_k_indices]
+        
+        # Retrieve top-k keyframe features
+        # Concatenate global_feat and pose_feat: [B, 1, C] + [B, 1, C] -> [B, 1, 2*C]
+        keyframe_features_list = []
+        for idx in top_k_indices:
+            global_feat = self.features[idx]  # [B, 1, C]
+            pose_feat = self.pose_features[idx]  # [B, 1, C]
+            # Concatenate along feature dimension
+            combined = torch.cat([global_feat, pose_feat], dim=-1)  # [B, 1, 2*C]
+            keyframe_features_list.append(combined)
+        
+        if len(keyframe_features_list) > 0:
+            # Stack: [K, B, 1, 2*C] -> [B, K, 1, 2*C] -> [B, K, 2*C]
+            keyframe_features = torch.stack(keyframe_features_list, dim=0)  # [K, B, 1, 2*C]
+            keyframe_features = keyframe_features.permute(1, 0, 2, 3)  # [B, K, 1, 2*C]
+            keyframe_features = keyframe_features.squeeze(2)  # [B, K, 2*C]
+        else:
+            keyframe_features = None
+        
+        return keyframe_features, top_k_indices
+    
+    def clear(self):
+        """Clear all stored keyframes."""
+        self.features = []
+        self.pose_features = []
+        self.timestamps = []
+        self.size = 0
+
 
 class ARCroco3DStereo(CroCoNet):
     config_class = ARCroco3DStereoConfig
@@ -310,6 +531,15 @@ class ARCroco3DStereo(CroCoNet):
             **self.croco_args,
         )
         self.set_freeze(config.freeze)
+        
+        # Initialize Keyframe Memory Bank if enabled
+        if config.use_keyframe_memory_bank:
+            self.keyframe_memory_bank = KeyframeMemoryBank(
+                max_size=config.keyframe_memory_max_size,
+                device='cuda'  # Will be set properly during inference
+            )
+        else:
+            self.keyframe_memory_bank = None
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
@@ -1206,18 +1436,52 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 raise NotImplementedError
 
+            reset_mask = view.get("reset", None)
+            if reset_mask is not None:
+                if isinstance(reset_mask, torch.Tensor):
+                    reset_mask_bool = reset_mask.item() if reset_mask.numel() == 1 else reset_mask.any().item()
+                else:
+                    reset_mask_bool = bool(reset_mask)
+            else:
+                reset_mask_bool = False
+
             if i == 0:
                 state_feat, state_pos = self._init_state(feat_i, pos_i)
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
+                # Initialize/reset Keyframe Memory Bank if enabled
+                if self.keyframe_memory_bank is not None:
+                    self.keyframe_memory_bank.clear()
+                    self.keyframe_memory_bank.device = device
+            
+            # Reset Keyframe Memory Bank if reset_mask is True
+            if self.keyframe_memory_bank is not None and reset_mask_bool:
+                self.keyframe_memory_bank.clear()
 
             if self.pose_head_flag:
                 global_img_feat_i = self._get_img_level_feat(feat_i)
-                if i == 0 or reset_mask:
+                
+                if i == 0 or reset_mask_bool:
                     pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
                 else:
-                    pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
+                    # Retrieve top-k keyframes from Memory Bank if enabled
+                    keyframe_features = None
+                    if self.keyframe_memory_bank is not None and self.keyframe_memory_bank.size > 0:
+                        keyframe_features, _ = self.keyframe_memory_bank.retrieve_top_k(
+                            query_feat=global_img_feat_i,
+                            query_time=i,
+                            k=self.config.keyframe_memory_top_k,
+                            lambda_time=self.config.keyframe_memory_lambda_time
+                        )
+                    
+                    # Use enhanced inquire method with keyframe features
+                    if keyframe_features is not None:
+                        pose_feat_i = self.pose_retriever.inquire_with_keyframes(
+                            global_img_feat_i, mem, keyframe_features
+                        )
+                    else:
+                        pose_feat_i = self.pose_retriever.inquire(global_img_feat_i, mem)
                 pose_pos_i = -torch.ones(
                     feat_i.shape[0], 1, 2, device=feat_i.device, dtype=pos_i.dtype
                 )
@@ -1238,6 +1502,14 @@ class ARCroco3DStereo(CroCoNet):
                 return_attn=True,
             )
             out_pose_feat_i = dec[-1][:, 0:1]
+
+            # Add current frame to Keyframe Memory Bank if enabled
+            if self.keyframe_memory_bank is not None and self.pose_head_flag:
+                self.keyframe_memory_bank.add(
+                    frame_idx=i,
+                    global_feat=global_img_feat_i,
+                    pose_feat=out_pose_feat_i
+                )
 
             # update mem
             new_mem = self.pose_retriever.update_mem(
@@ -1285,13 +1557,13 @@ class ARCroco3DStereo(CroCoNet):
                 1 - update_mask2
             )  # then update local state
 
-            reset_mask = view["reset"]
-            if reset_mask is not None:
-                reset_mask = reset_mask[:, None, None].float()
-                state_feat = init_state_feat * reset_mask + state_feat * (
-                    1 - reset_mask
+            reset_mask_tensor = view.get("reset", None)
+            if reset_mask_tensor is not None:
+                reset_mask_tensor = reset_mask_tensor[:, None, None].float()
+                state_feat = init_state_feat * reset_mask_tensor + state_feat * (
+                    1 - reset_mask_tensor
                 )
-                mem = init_mem * reset_mask + mem * (1 - reset_mask)
+                mem = init_mem * reset_mask_tensor + mem * (1 - reset_mask_tensor)
 
         if ret_state:
             return ress, views, all_state_args
