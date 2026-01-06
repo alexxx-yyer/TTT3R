@@ -1373,7 +1373,7 @@ class ARCroco3DStereo(CroCoNet):
     def forward_recurrent_lighter(self, views, device='cuda', ret_state=False):
         ress = []
         all_state_args = []
-        reset_mask = False
+        prev_reset_mask_bool = False  # Track previous frame's reset for pose_feat initialization
         for i, _view in enumerate(views):
             view = to_gpu(_view, device)
             device = view["img"].device
@@ -1461,8 +1461,8 @@ class ARCroco3DStereo(CroCoNet):
 
             if self.pose_head_flag:
                 global_img_feat_i = self._get_img_level_feat(feat_i)
-                
-                if i == 0 or reset_mask_bool:
+
+                if i == 0 or prev_reset_mask_bool:
                     pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
                 else:
                     # Retrieve top-k keyframes from Memory Bank if enabled
@@ -1537,7 +1537,7 @@ class ARCroco3DStereo(CroCoNet):
             update_mask = update_mask[:, None, None].float()
 
             # update with learning rate
-            if i  == 0 or reset_mask:
+            if i == 0 or prev_reset_mask_bool:
                 update_mask1 = update_mask
             else:
                 if self.config.model_update_type == "cut3r":
@@ -1564,6 +1564,9 @@ class ARCroco3DStereo(CroCoNet):
                     1 - reset_mask_tensor
                 )
                 mem = init_mem * reset_mask_tensor + mem * (1 - reset_mask_tensor)
+
+            # Update prev_reset_mask_bool for next iteration (original TTT3R behavior)
+            prev_reset_mask_bool = reset_mask_bool
 
         if ret_state:
             return ress, views, all_state_args
