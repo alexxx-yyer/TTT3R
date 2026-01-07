@@ -335,53 +335,50 @@ class KeyframeMemoryBank:
         cosine_sim = (query_norm * bank_norm).sum(dim=-1, keepdim=True)  # [B, 1, 1]
         return cosine_sim.squeeze(-1)  # [B, 1]
     
-    def compute_time_similarity(self, query_time, bank_time):
+    def compute_time_similarity(self, query_time, bank_time, device):
         """
         Compute time similarity using Gaussian decay.
-        
+
         Formula: sim_time = exp(-(time(F_i) - time(X_hat))^2)
-        
+
         Args:
             query_time: Scalar or tensor query timestamp
             bank_time: Scalar or tensor bank timestamp
-            
+            device: Device to create tensor on
+
         Returns:
-            Time similarity score (scalar or tensor)
+            Time similarity score as tensor on specified device
         """
         time_diff = query_time - bank_time
-        time_sim = torch.exp(-(time_diff ** 2))
+        time_sim = torch.exp(torch.tensor(-(time_diff ** 2), dtype=torch.float32, device=device))
         return time_sim
-    
+
     def compute_hybrid_similarity(self, query_feat, query_time, lambda_time):
         """
         Compute hybrid similarity for all keyframes in the bank.
-        
+
         Formula: sim_hybrid = sim_cos + lambda_time * sim_time
-        
+
         Args:
             query_feat: [B, 1, C] query feature
             query_time: Scalar query timestamp (frame index)
             lambda_time: Weight for time similarity
-            
+
         Returns:
             List of [B, 1] hybrid similarity scores for each keyframe
         """
         if self.size == 0:
             return []
-        
+
+        device = query_feat.device
         similarities = []
         for i in range(self.size):
             # Compute cosine similarity
             cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])  # [B, 1]
-            
-            # Compute time similarity
-            time_sim = self.compute_time_similarity(query_time, self.timestamps[i])
-            # Ensure time_sim has same shape as cos_sim
-            if isinstance(time_sim, torch.Tensor):
-                time_sim = time_sim.unsqueeze(-1) if time_sim.dim() == 0 else time_sim
-            else:
-                time_sim = torch.tensor(time_sim, device=query_feat.device).unsqueeze(-1)
-            
+
+            # Compute time similarity on same device as query_feat
+            time_sim = self.compute_time_similarity(query_time, self.timestamps[i], device)
+
             # Compute hybrid similarity
             hybrid_sim = cos_sim + lambda_time * time_sim
             similarities.append(hybrid_sim)
@@ -1468,8 +1465,10 @@ class ARCroco3DStereo(CroCoNet):
                     # Retrieve top-k keyframes from Memory Bank if enabled
                     keyframe_features = None
                     if self.keyframe_memory_bank is not None and self.keyframe_memory_bank.size > 0:
+                        # Project query to match stored features (proj_q projects to v_dim)
+                        proj_query_feat = self.pose_retriever.proj_q(global_img_feat_i)
                         keyframe_features, _ = self.keyframe_memory_bank.retrieve_top_k(
-                            query_feat=global_img_feat_i,
+                            query_feat=proj_query_feat,
                             query_time=i,
                             k=self.config.keyframe_memory_top_k,
                             lambda_time=self.config.keyframe_memory_lambda_time
@@ -1504,10 +1503,12 @@ class ARCroco3DStereo(CroCoNet):
             out_pose_feat_i = dec[-1][:, 0:1]
 
             # Add current frame to Keyframe Memory Bank if enabled
+            # Project global_feat to match memory format (proj_q projects to v_dim)
             if self.keyframe_memory_bank is not None and self.pose_head_flag:
+                proj_global_feat = self.pose_retriever.proj_q(global_img_feat_i)
                 self.keyframe_memory_bank.add(
                     frame_idx=i,
-                    global_feat=global_img_feat_i,
+                    global_feat=proj_global_feat,
                     pose_feat=out_pose_feat_i
                 )
 
