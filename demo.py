@@ -26,6 +26,8 @@ import cv2
 import argparse
 import tempfile
 import shutil
+import gc
+import atexit
 from copy import deepcopy
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
@@ -37,10 +39,189 @@ from tqdm import tqdm
 from skimage.filters import threshold_otsu, threshold_multiotsu
 from einops import rearrange
 
+
+class OnlineDiskCache:
+    """
+    参考 VGGT-Long 的内存管理机制：
+    - Online 推理阶段：逐帧将结果保存到磁盘
+    - Global Alignment 阶段：从磁盘读取数据进行后处理
+    - 任务结束时自动清理临时文件
+    """
+    def __init__(self, cache_dir=None, delete_temp_files=True):
+        if cache_dir is None:
+            self.cache_dir = tempfile.mkdtemp(prefix="ttt3r_cache_")
+        else:
+            self.cache_dir = os.path.join(cache_dir, "_tmp_results")
+            os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.pred_dir = os.path.join(self.cache_dir, "pred")
+        self.view_dir = os.path.join(self.cache_dir, "view")
+        os.makedirs(self.pred_dir, exist_ok=True)
+        os.makedirs(self.view_dir, exist_ok=True)
+
+        self.delete_temp_files = delete_temp_files
+        self.num_frames = 0
+
+        # 注册退出时清理
+        atexit.register(self.cleanup)
+        print(f"[OnlineDiskCache] 临时缓存目录: {self.cache_dir}")
+
+    def save_frame(self, frame_idx, pred, view):
+        """保存单帧的预测结果和视图数据到磁盘"""
+        # 保存 pred（转换为 CPU numpy）
+        pred_data = {}
+        for k, v in pred.items():
+            if isinstance(v, torch.Tensor):
+                pred_data[k] = v.cpu().numpy()
+            else:
+                pred_data[k] = v
+        np.save(os.path.join(self.pred_dir, f"{frame_idx:06d}.npy"), pred_data)
+
+        # 保存 view（转换为 CPU numpy）
+        view_data = {}
+        for k, v in view.items():
+            if isinstance(v, torch.Tensor):
+                view_data[k] = v.cpu().numpy()
+            else:
+                view_data[k] = v
+        np.save(os.path.join(self.view_dir, f"{frame_idx:06d}.npy"), view_data)
+
+        self.num_frames = max(self.num_frames, frame_idx + 1)
+
+    def save_outputs(self, outputs):
+        """保存完整的 outputs 到磁盘，然后释放内存"""
+        print(f"[OnlineDiskCache] 正在将 {len(outputs['pred'])} 帧保存到磁盘...")
+        for i in tqdm(range(len(outputs["pred"])), desc="保存帧数据到磁盘"):
+            self.save_frame(i, outputs["pred"][i], outputs["views"][i])
+
+        self.num_frames = len(outputs["pred"])
+
+        # 释放原始数据
+        del outputs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print(f"[OnlineDiskCache] 已保存 {self.num_frames} 帧，内存已释放")
+
+    def load_frame(self, frame_idx, device='cpu'):
+        """从磁盘加载单帧数据"""
+        pred_path = os.path.join(self.pred_dir, f"{frame_idx:06d}.npy")
+        view_path = os.path.join(self.view_dir, f"{frame_idx:06d}.npy")
+
+        pred_data = np.load(pred_path, allow_pickle=True).item()
+        view_data = np.load(view_path, allow_pickle=True).item()
+
+        # 转换回 tensor
+        pred = {}
+        for k, v in pred_data.items():
+            if isinstance(v, np.ndarray):
+                pred[k] = torch.from_numpy(v).to(device)
+            else:
+                pred[k] = v
+
+        view = {}
+        for k, v in view_data.items():
+            if isinstance(v, np.ndarray):
+                view[k] = torch.from_numpy(v).to(device)
+            else:
+                view[k] = v
+
+        return pred, view
+
+    def load_frame_pair(self, idx1, idx2, device='cpu'):
+        """加载一对相邻帧用于 global alignment"""
+        pred1, view1 = self.load_frame(idx1, device)
+        pred2, view2 = self.load_frame(idx2, device)
+        return pred1, view1, pred2, view2
+
+    def get_num_frames(self):
+        """获取已保存的帧数"""
+        return self.num_frames
+
+    def cleanup(self):
+        """清理所有临时文件"""
+        if self.delete_temp_files and os.path.exists(self.cache_dir):
+            try:
+                # 计算释放的空间
+                total_size = 0
+                for root, dirs, files in os.walk(self.cache_dir):
+                    for f in files:
+                        total_size += os.path.getsize(os.path.join(root, f))
+
+                shutil.rmtree(self.cache_dir)
+                print(f"[OnlineDiskCache] 已清理缓存，释放 {total_size / 1024 / 1024 / 1024:.2f} GiB 磁盘空间")
+            except Exception as e:
+                print(f"[OnlineDiskCache] 清理缓存失败: {e}")
+
+    def clear_memory(self):
+        """强制清理 Python 内存"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+# 全局缓存实例
+_global_disk_cache = None
+
+def get_disk_cache(cache_dir=None):
+    """获取或创建全局磁盘缓存实例"""
+    global _global_disk_cache
+    if _global_disk_cache is None:
+        _global_disk_cache = OnlineDiskCache(cache_dir)
+    return _global_disk_cache
+
 # Set random seed for reproducibility.
 random.seed(42)
 
 framerate = 30
+
+def forward_backward_permutations(n, interval=1):
+    """Generate forward and backward permutations for pairwise inference."""
+    original = list(range(n))
+    result = [original]
+    for i in range(1, n):
+        new_list = original[i::interval]
+        result.append(new_list)
+        new_list = original[: i + 1][::-interval]
+        result.append(new_list)
+    return result
+
+def listify(elems):
+    return [x for e in elems for x in e]
+
+def collate_with_cat(whatever, lists=False):
+    """Collate and concatenate tensors from a nested structure."""
+    if isinstance(whatever, dict):
+        return {k: collate_with_cat(vals, lists=lists) for k, vals in whatever.items()}
+
+    elif isinstance(whatever, (tuple, list)):
+        if len(whatever) == 0:
+            return whatever
+        elem = whatever[0]
+        T = type(whatever)
+
+        if elem is None:
+            return None
+        if isinstance(elem, (bool, float, int, str)):
+            return whatever
+        if isinstance(elem, tuple):
+            return T(collate_with_cat(x, lists=lists) for x in zip(*whatever))
+        if isinstance(elem, dict):
+            return {
+                k: collate_with_cat([e[k] for e in whatever], lists=lists) for k in elem
+            }
+
+        if isinstance(elem, torch.Tensor):
+            return listify(whatever) if lists else torch.cat(whatever)
+        if isinstance(elem, np.ndarray):
+            return (
+                listify(whatever)
+                if lists
+                else torch.cat([torch.from_numpy(x) for x in whatever])
+            )
+
+        # otherwise, we just chain lists
+        return sum(whatever, T())
 
 def parse_args():
     """Parse command-line arguments."""
@@ -135,6 +316,23 @@ def parse_args():
         type=int,
         default=None,
         help="Maximum size of Keyframe Memory Bank (None for unlimited)",
+    )
+    parser.add_argument(
+        "--use_global_alignment",
+        action="store_true",
+        help="Enable global alignment optimization after inference",
+    )
+    parser.add_argument(
+        "--ga_niter",
+        type=int,
+        default=300,
+        help="Number of iterations for global alignment optimization",
+    )
+    parser.add_argument(
+        "--ga_lr",
+        type=float,
+        default=0.01,
+        help="Learning rate for global alignment optimization",
     )
     return parser.parse_args()
 
@@ -254,14 +452,163 @@ def prepare_input(
     return views
 
 
-def prepare_output(outputs, outdir, revisit=1, use_pose=True):
+def _prepare_output_with_global_alignment(outdir, device, ga_niter, ga_lr, disk_cache):
+    """
+    从磁盘读取数据进行 global alignment（参考 VGGT-Long 的内存管理机制）。
+
+    Args:
+        outdir: 输出目录
+        device: 计算设备
+        ga_niter: global alignment 迭代次数
+        ga_lr: global alignment 学习率
+        disk_cache: 磁盘缓存实例
+
+    Returns:
+        tuple: (points, colors, confidence, camera parameters dictionary)
+    """
+    from cloud_opt.dust3r_opt import global_aligner, GlobalAlignerMode
+    import imageio.v2 as iio
+
+    print("Applying global alignment optimization (VGGT-Long style)...")
+
+    num_frames = disk_cache.get_num_frames()
+    print(f"[DiskCache] 从磁盘读取 {num_frames} 帧数据进行 global alignment...")
+
+    # 逐帧从磁盘加载并构建 pairwise 数据
+    view1_list = []
+    view2_list = []
+    pred1_list = []
+    pred2_list = []
+
+    for i in tqdm(range(num_frames - 1), desc="从磁盘加载帧对"):
+        pred1, view1 = disk_cache.load_frame(i, device='cpu')
+        pred2, view2 = disk_cache.load_frame(i + 1, device='cpu')
+
+        view1_list.append(view1)
+        view2_list.append(view2)
+        pred1_list.append(pred1)
+        pred2_list.append(pred2)
+
+        # 每加载一批后清理内存
+        if (i + 1) % 50 == 0:
+            gc.collect()
+
+    print(f"[DiskCache] 已加载 {len(view1_list)} 对帧")
+
+    # Collate the data
+    output_ga = {
+        "view1": collate_with_cat(view1_list),
+        "view2": collate_with_cat(view2_list),
+        "pred1": collate_with_cat(pred1_list),
+        "pred2": collate_with_cat(pred2_list),
+    }
+
+    # 释放临时列表
+    del view1_list, view2_list, pred1_list, pred2_list
+    disk_cache.clear_memory()
+    print("[Memory] 数据合并完成")
+
+    # Run global alignment
+    with torch.enable_grad():
+        mode = GlobalAlignerMode.PointCloudOptimizer
+        scene = global_aligner(
+            output_ga,
+            device=device,
+            mode=mode,
+            verbose=True,
+        )
+
+        # 释放 output_ga
+        del output_ga
+        disk_cache.clear_memory()
+        print("[Memory] 已释放 output_ga")
+
+        _ = scene.compute_global_alignment(
+            init="mst",
+            niter=ga_niter,
+            schedule="linear",
+            lr=ga_lr,
+        )
+
+    scene.clean_pointcloud()
+
+    # 清理磁盘缓存文件
+    disk_cache.cleanup()
+    print("[DiskCache] 临时缓存已清理")
+
+    pts3d = scene.get_pts3d()
+    depths = scene.get_depthmaps()
+    poses = scene.get_im_poses()
+    focals = scene.get_focals()
+    pps = scene.get_principal_points()
+    confs = scene.get_conf(mode="none")
+
+    # Convert to the expected format
+    pts3ds_other = [pts.detach().cpu().unsqueeze(0) for pts in pts3d]
+    depths_ga = [d.detach().cpu().unsqueeze(0) for d in depths]
+    colors_ga = [torch.from_numpy(img).unsqueeze(0) for img in scene.imgs]
+    confs_ga = [conf.detach().cpu().unsqueeze(0) for conf in confs]
+
+    cam_dict = {
+        "focal": focals.detach().cpu().numpy(),
+        "pp": pps.detach().cpu().numpy(),
+        "R": poses.detach().cpu().numpy()[..., :3, :3],
+        "t": poses.detach().cpu().numpy()[..., :3, 3],
+    }
+
+    # Save global alignment results
+    depths_tosave = torch.cat(depths_ga)
+    pts3ds_other_tosave = torch.cat(pts3ds_other)
+    conf_self_tosave = torch.cat(confs_ga)
+    colors_tosave = torch.cat(colors_ga)
+    cam2world_tosave = poses.detach().cpu()
+    intrinsics_tosave = torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
+    intrinsics_tosave[:, 0, 0] = focals[:, 0].detach().cpu()
+    intrinsics_tosave[:, 1, 1] = focals[:, 0].detach().cpu()
+    intrinsics_tosave[:, 0, 2] = pps[:, 0].detach().cpu()
+    intrinsics_tosave[:, 1, 2] = pps[:, 1].detach().cpu()
+
+    # Save files
+    for subdir in ["depth", "conf", "color", "camera"]:
+        path = os.path.join(outdir, subdir)
+        if os.path.exists(path):
+            shutil.rmtree(path)
+        os.makedirs(path, exist_ok=True)
+
+    for f_id in range(len(depths_tosave)):
+        depth = depths_tosave[f_id].cpu().numpy()
+        conf = conf_self_tosave[f_id].cpu().numpy()
+        color = colors_tosave[f_id].cpu().numpy()
+        c2w = cam2world_tosave[f_id].cpu().numpy()
+        intrins = intrinsics_tosave[f_id].cpu().numpy()
+        np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depth)
+        np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf)
+        iio.imwrite(
+            os.path.join(outdir, "color", f"{f_id:06d}.png"),
+            (color * 255).astype(np.uint8),
+        )
+        np.savez(
+            os.path.join(outdir, "camera", f"{f_id:06d}.npz"),
+            pose=c2w,
+            intrinsics=intrins,
+        )
+
+    return pts3ds_other, colors_ga, confs_ga, cam_dict
+
+
+def prepare_output(outputs, outdir, revisit=1, use_pose=True, use_global_alignment=False, device="cuda", ga_niter=300, ga_lr=0.01, disk_cache=None):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
 
     Args:
-        outputs (dict): Inference outputs.
+        outputs (dict): Inference outputs (可以为 None，如果 disk_cache 已提供).
         revisit (int): Number of revisits per view.
         use_pose (bool): Whether to transform points using camera pose.
+        use_global_alignment (bool): Whether to apply global alignment optimization.
+        device (str): Device for global alignment.
+        ga_niter (int): Number of iterations for global alignment.
+        ga_lr (float): Learning rate for global alignment.
+        disk_cache (OnlineDiskCache): 磁盘缓存实例，用于从磁盘读取数据.
 
     Returns:
         tuple: (points, colors, confidence, camera parameters dictionary)
@@ -272,7 +619,14 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     import roma
     from viser_utils import convert_scene_output_to_glb
 
+    # 如果使用 global alignment 且有 disk_cache，直接跳到 global alignment
+    # 数据将从磁盘读取，不需要 outputs
+    if use_global_alignment and disk_cache is not None:
+        return _prepare_output_with_global_alignment(
+            outdir, device, ga_niter, ga_lr, disk_cache
+        )
 
+    # 常规处理流程（不使用 global alignment，或没有 disk_cache）
     # Only keep the outputs corresponding to one full pass.
     valid_length = len(outputs["pred"]) // revisit
     outputs["pred"] = outputs["pred"][-valid_length:]
@@ -356,6 +710,9 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     intrinsics_tosave[:, 0, 2] = pp[:, 0]
     intrinsics_tosave[:, 1, 2] = pp[:, 1]
 
+    # # convert_scene_output_to_glb(outdir, (colors_tosave * 255).to(torch.uint8), pts3ds_other_tosave, conf_other_tosave > 1, focal, cam2world_tosave, as_pointcloud=True)
+
+    # Save files (without global alignment)
     if os.path.exists(os.path.join(outdir, "depth")):
         shutil.rmtree(os.path.join(outdir, "depth"))
     if os.path.exists(os.path.join(outdir, "conf")):
@@ -385,8 +742,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
             pose=c2w,
             intrinsics=intrins,
         )
-
-    # # convert_scene_output_to_glb(outdir, (colors_tosave * 255).to(torch.uint8), pts3ds_other_tosave, conf_other_tosave > 1, focal, cam2world_tosave, as_pointcloud=True)
+    
     return pts3ds_other, colors, conf_other, cam_dict
 
 def parse_seq_path(p, frame_interval=1):
@@ -485,6 +841,11 @@ def run_inference(args):
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
     model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
+
+    # Debug: print model config
+    print(f"Model config: head_type={model.head_type}, pose_head_flag={model.pose_head_flag}")
+    print(f"Has pose_retriever: {hasattr(model, 'pose_retriever') and model.pose_retriever is not None}")
+
     model.config.model_update_type = args.model_update_type
     
     # Set Keyframe Memory Bank parameters
@@ -495,11 +856,36 @@ def run_inference(args):
     
     # Initialize Keyframe Memory Bank if enabled
     if args.use_keyframe_memory_bank:
-        from src.dust3r.model import KeyframeMemoryBank
+        from src.dust3r.model import KeyframeMemoryBank, LocalMemory
+        from functools import partial
+        import torch.nn as nn
+
         model.keyframe_memory_bank = KeyframeMemoryBank(
             max_size=args.keyframe_memory_max_size,
             device=device
         )
+
+        # Enable pose_head_flag since keyframe memory bank requires it
+        model.pose_head_flag = True
+
+        # Initialize pose_token and pose_retriever if they don't exist
+        if not hasattr(model, 'pose_retriever') or model.pose_retriever is None:
+            print("Initializing pose_retriever for keyframe memory bank...")
+            model.pose_token = nn.Parameter(
+                torch.randn(1, 1, model.dec_embed_dim) * 0.02, requires_grad=False
+            ).to(device)
+            model.pose_retriever = LocalMemory(
+                size=model.config.local_mem_size,
+                k_dim=model.enc_embed_dim,
+                v_dim=model.dec_embed_dim,
+                num_heads=model.dec_num_heads,
+                mlp_ratio=4,
+                qkv_bias=True,
+                attn_drop=0.0,
+                norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                rope=None,
+            ).to(device)
+
         print(f"Keyframe Memory Bank enabled: lambda_time={args.keyframe_memory_lambda_time}, "
               f"top_k={args.keyframe_memory_top_k}, max_size={args.keyframe_memory_max_size}")
 
@@ -517,10 +903,24 @@ def run_inference(args):
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame), FPS: {FPS_num:.2f}."
     )
 
+    # 如果使用 global alignment，先将 outputs 保存到磁盘（参考 VGGT-Long）
+    disk_cache = None
+    if args.use_global_alignment:
+        print("[VGGT-Long Style] 将 online 推理结果保存到磁盘...")
+        disk_cache = OnlineDiskCache(cache_dir=args.output_dir)
+        disk_cache.save_outputs(outputs)
+        # outputs 已在 save_outputs 中被释放
+        outputs = None
+
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
-        outputs, args.output_dir, 1, True
+        outputs, args.output_dir, 1, True,
+        use_global_alignment=args.use_global_alignment,
+        device=device,
+        ga_niter=args.ga_niter,
+        ga_lr=args.ga_lr,
+        disk_cache=disk_cache
     )
 
     # Convert tensors to numpy arrays for visualization.

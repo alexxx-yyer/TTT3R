@@ -1447,34 +1447,44 @@ class ARCroco3DStereo(CroCoNet):
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
                 init_state_feat = state_feat.clone()
                 init_mem = mem.clone()
-                # Initialize/reset Keyframe Memory Bank if enabled
+                # Initialize Keyframe Memory Bank device (but don't clear - preserve long-term memory)
                 if self.keyframe_memory_bank is not None:
-                    self.keyframe_memory_bank.clear()
                     self.keyframe_memory_bank.device = device
-            
-            # Reset Keyframe Memory Bank if reset_mask is True
-            if self.keyframe_memory_bank is not None and reset_mask_bool:
-                self.keyframe_memory_bank.clear()
+
+            # NOTE: Keyframe Memory Bank is NOT cleared on reset - it serves as long-term memory
+            # that persists across segments to help with re-localization
 
             if self.pose_head_flag:
                 global_img_feat_i = self._get_img_level_feat(feat_i)
 
+                # Retrieve keyframes from long-term memory if available
+                keyframe_features = None
+                if self.keyframe_memory_bank is not None and self.keyframe_memory_bank.size > 0:
+                    proj_query_feat = self.pose_retriever.proj_q(global_img_feat_i)
+                    keyframe_features, _ = self.keyframe_memory_bank.retrieve_top_k(
+                        query_feat=proj_query_feat,
+                        query_time=i,
+                        k=self.config.keyframe_memory_top_k,
+                        lambda_time=self.config.keyframe_memory_lambda_time
+                    )
+                    if i % 50 == 0:
+                        print(f"[KMB Debug] Frame {i}: retrieved {keyframe_features.shape[1]} keyframes from bank size {self.keyframe_memory_bank.size}")
+
                 if i == 0 or prev_reset_mask_bool:
-                    pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
-                else:
-                    # Retrieve top-k keyframes from Memory Bank if enabled
-                    keyframe_features = None
-                    if self.keyframe_memory_bank is not None and self.keyframe_memory_bank.size > 0:
-                        # Project query to match stored features (proj_q projects to v_dim)
-                        proj_query_feat = self.pose_retriever.proj_q(global_img_feat_i)
-                        keyframe_features, _ = self.keyframe_memory_bank.retrieve_top_k(
-                            query_feat=proj_query_feat,
-                            query_time=i,
-                            k=self.config.keyframe_memory_top_k,
-                            lambda_time=self.config.keyframe_memory_lambda_time
+                    # After reset: use keyframe memory to initialize pose_feat if available
+                    if keyframe_features is not None:
+                        # Use keyframe features to provide initial pose context
+                        # inquire_with_keyframes uses init_mem since local mem was just reset
+                        pose_feat_i = self.pose_retriever.inquire_with_keyframes(
+                            global_img_feat_i, mem, keyframe_features
                         )
-                    
-                    # Use enhanced inquire method with keyframe features
+                        if prev_reset_mask_bool:
+                            print(f"[KMB] Frame {i}: Reset - initialized pose_feat from {keyframe_features.shape[1]} keyframes")
+                    else:
+                        # No keyframe memory available, fall back to pose_token
+                        pose_feat_i = self.pose_token.expand(feat_i.shape[0], -1, -1)
+                else:
+                    # Normal frame: use both local memory and keyframe memory
                     if keyframe_features is not None:
                         pose_feat_i = self.pose_retriever.inquire_with_keyframes(
                             global_img_feat_i, mem, keyframe_features
