@@ -308,7 +308,7 @@ def parse_args():
     parser.add_argument(
         "--keyframe_memory_top_k",
         type=int,
-        default=5,
+        default=64,
         help="Number of top-k keyframes to retrieve from Memory Bank",
     )
     parser.add_argument(
@@ -316,6 +316,12 @@ def parse_args():
         type=int,
         default=None,
         help="Maximum size of Keyframe Memory Bank (None for unlimited)",
+    )
+    parser.add_argument(
+        "--keyframe_memory_diversity_threshold",
+        type=float,
+        default=0.9,
+        help="Diversity threshold for keyframe sampling (only add if similarity < threshold)",
     )
     parser.add_argument(
         "--use_global_alignment",
@@ -333,6 +339,30 @@ def parse_args():
         type=float,
         default=0.01,
         help="Learning rate for global alignment optimization",
+    )
+    # Loop closure arguments
+    parser.add_argument(
+        "--enable_loop_closure",
+        action="store_true",
+        help="Enable loop closure detection and correction",
+    )
+    parser.add_argument(
+        "--loop_closure_threshold",
+        type=float,
+        default=0.99,
+        help="Similarity threshold for loop closure detection",
+    )
+    parser.add_argument(
+        "--loop_closure_min_frame_gap",
+        type=int,
+        default=30,
+        help="Minimum frame gap for loop closure detection",
+    )
+    parser.add_argument(
+        "--loop_closure_keyframe_interval",
+        type=int,
+        default=10,
+        help="Interval for adding keyframes to loop closure database",
     )
     return parser.parse_args()
 
@@ -795,6 +825,106 @@ def parse_seq_path(p, frame_interval=1):
     return img_paths, tmpdirname
 
 
+def visualize_loop_closures(cam_dict, loop_closures, output_dir):
+    """
+    Visualize camera trajectory with loop closure connections.
+
+    Args:
+        cam_dict: Dictionary containing camera parameters (R, t, focal, pp)
+        loop_closures: List of loop closure dictionaries
+        output_dir: Directory to save the visualization
+    """
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+
+    # Extract camera positions
+    R = cam_dict['R']  # [N, 3, 3]
+    t = cam_dict['t']  # [N, 3]
+
+    # Camera positions in world coordinates
+    # For c2w matrices, t is already the camera position
+    positions = t  # [N, 3]
+
+    # Create 3D plot
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot camera trajectory
+    ax.plot(positions[:, 0], positions[:, 1], positions[:, 2],
+            'b-', linewidth=1, alpha=0.6, label='Camera Trajectory')
+
+    # Mark start and end points
+    ax.scatter(positions[0, 0], positions[0, 1], positions[0, 2],
+               c='green', s=100, marker='o', label='Start')
+    ax.scatter(positions[-1, 0], positions[-1, 1], positions[-1, 2],
+               c='red', s=100, marker='s', label='End')
+
+    # Plot loop closure connections
+    for lc in loop_closures:
+        current_idx = lc['current_idx']
+        matched_idx = lc['matched_idx']
+        confidence = lc['confidence']
+
+        if current_idx < len(positions) and matched_idx < len(positions):
+            p1 = positions[current_idx]
+            p2 = positions[matched_idx]
+
+            # Draw loop closure connection (red dashed line)
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]],
+                    'r--', linewidth=2, alpha=0.8)
+
+            # Mark the loop closure points
+            ax.scatter(p1[0], p1[1], p1[2], c='orange', s=60, marker='^')
+            ax.scatter(p2[0], p2[1], p2[2], c='purple', s=60, marker='v')
+
+    # Add legend for loop closures
+    if len(loop_closures) > 0:
+        ax.plot([], [], 'r--', linewidth=2, label=f'Loop Closures ({len(loop_closures)})')
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title(f'Camera Trajectory with Loop Closures\n({len(loop_closures)} loops detected)')
+    ax.legend()
+
+    # Save figure
+    output_path = os.path.join(output_dir, 'loop_closure_trajectory.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Loop closure trajectory visualization saved to: {output_path}")
+
+    # Also create a 2D top-down view (X-Z plane)
+    fig2, ax2 = plt.subplots(figsize=(10, 10))
+    ax2.plot(positions[:, 0], positions[:, 2], 'b-', linewidth=1, alpha=0.6, label='Camera Trajectory')
+    ax2.scatter(positions[0, 0], positions[0, 2], c='green', s=100, marker='o', label='Start')
+    ax2.scatter(positions[-1, 0], positions[-1, 2], c='red', s=100, marker='s', label='End')
+
+    for lc in loop_closures:
+        current_idx = lc['current_idx']
+        matched_idx = lc['matched_idx']
+
+        if current_idx < len(positions) and matched_idx < len(positions):
+            p1 = positions[current_idx]
+            p2 = positions[matched_idx]
+            ax2.plot([p1[0], p2[0]], [p1[2], p2[2]], 'r--', linewidth=2, alpha=0.8)
+            ax2.scatter(p1[0], p1[2], c='orange', s=60, marker='^')
+            ax2.scatter(p2[0], p2[2], c='purple', s=60, marker='v')
+
+    if len(loop_closures) > 0:
+        ax2.plot([], [], 'r--', linewidth=2, label=f'Loop Closures ({len(loop_closures)})')
+
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Z')
+    ax2.set_title(f'Camera Trajectory (Top-Down View)\n({len(loop_closures)} loops detected)')
+    ax2.legend()
+    ax2.axis('equal')
+
+    output_path_2d = os.path.join(output_dir, 'loop_closure_trajectory_2d.png')
+    plt.savefig(output_path_2d, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Loop closure trajectory (2D) visualization saved to: {output_path_2d}")
+
+
 def run_inference(args):
     """
     Execute the full inference and visualization pipeline.
@@ -853,7 +983,8 @@ def run_inference(args):
     model.config.keyframe_memory_lambda_time = args.keyframe_memory_lambda_time
     model.config.keyframe_memory_top_k = args.keyframe_memory_top_k
     model.config.keyframe_memory_max_size = args.keyframe_memory_max_size
-    
+    model.config.keyframe_memory_diversity_threshold = args.keyframe_memory_diversity_threshold
+
     # Initialize Keyframe Memory Bank if enabled
     if args.use_keyframe_memory_bank:
         from src.dust3r.model import KeyframeMemoryBank, LocalMemory
@@ -862,7 +993,9 @@ def run_inference(args):
 
         model.keyframe_memory_bank = KeyframeMemoryBank(
             max_size=args.keyframe_memory_max_size,
-            device=device
+            device=device,
+            diversity_threshold=args.keyframe_memory_diversity_threshold,
+            min_interval=getattr(args, 'keyframe_memory_min_interval', 10)
         )
 
         # Enable pose_head_flag since keyframe memory bank requires it
@@ -887,7 +1020,37 @@ def run_inference(args):
             ).to(device)
 
         print(f"Keyframe Memory Bank enabled: lambda_time={args.keyframe_memory_lambda_time}, "
-              f"top_k={args.keyframe_memory_top_k}, max_size={args.keyframe_memory_max_size}")
+              f"top_k={args.keyframe_memory_top_k}, max_size={args.keyframe_memory_max_size}, "
+              f"diversity_threshold={args.keyframe_memory_diversity_threshold}")
+
+    # Initialize Loop Closure components if enabled
+    if args.enable_loop_closure:
+        from src.dust3r.model import LoopClosureKeyframeDB
+
+        model.config.enable_loop_closure = True
+        model.config.loop_closure_threshold = args.loop_closure_threshold
+        model.config.loop_closure_min_frame_gap = args.loop_closure_min_frame_gap
+        model.config.loop_closure_keyframe_interval = args.loop_closure_keyframe_interval
+
+        # Enable pose_head_flag since loop closure requires it
+        model.pose_head_flag = True
+
+        # Initialize loop closure components if they don't exist
+        if not hasattr(model, 'loop_closure_keyframe_db') or model.loop_closure_keyframe_db is None:
+            print("Initializing loop closure components with memory recall...")
+            model.loop_closure_keyframe_db = LoopClosureKeyframeDB(
+                max_keyframes=100,
+                feat_dim=model.enc_embed_dim,
+                state_dim=model.dec_embed_dim,
+                state_size=model.config.state_size,
+                mem_size=model.config.local_mem_size,
+                mem_dim=model.dec_embed_dim * 2,
+            ).to(device)
+            model.loop_closures = []
+
+        print(f"Loop Closure with Memory Recall enabled: threshold={args.loop_closure_threshold}, "
+              f"min_frame_gap={args.loop_closure_min_frame_gap}, "
+              f"keyframe_interval={args.loop_closure_keyframe_interval}")
 
     model.eval()
 
@@ -927,6 +1090,27 @@ def run_inference(args):
     pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
     colors_to_vis = [c.cpu().numpy() for c in colors]
     edge_colors = [None] * len(pts3ds_to_vis)
+
+    # Print loop closure summary if enabled
+    if args.enable_loop_closure and hasattr(model, 'loop_closures') and len(model.loop_closures) > 0:
+        print(f"\n{'='*60}")
+        print(f"Loop Closure Summary: {len(model.loop_closures)} loop(s) detected")
+        print(f"{'='*60}")
+        for lc in model.loop_closures:
+            print(f"  Frame {lc['current_idx']} -> Frame {lc['matched_idx']} (confidence: {lc['confidence']:.3f})")
+        print(f"{'='*60}\n")
+
+        # Save loop closure information to file
+        loop_closure_file = os.path.join(args.output_dir, "loop_closures.txt")
+        with open(loop_closure_file, 'w') as f:
+            f.write(f"Loop Closure Summary: {len(model.loop_closures)} loop(s) detected\n")
+            f.write("="*60 + "\n")
+            for lc in model.loop_closures:
+                f.write(f"Frame {lc['current_idx']} -> Frame {lc['matched_idx']} (confidence: {lc['confidence']:.3f})\n")
+        print(f"Loop closure information saved to: {loop_closure_file}")
+
+        # Visualize loop closures on trajectory
+        visualize_loop_closures(cam_dict, model.loop_closures, args.output_dir)
 
     # Create and run the point cloud viewer.
     print("Launching point cloud viewer...")

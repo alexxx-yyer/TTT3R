@@ -121,6 +121,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         keyframe_memory_lambda_time=0.1,
         keyframe_memory_top_k=5,
         keyframe_memory_max_size=None,
+        keyframe_memory_diversity_threshold=0.9,  # 只添加相似度低于此阈值的帧（投影特征相似度很高）
+        # Loop closure config
+        enable_loop_closure=False,
+        loop_closure_max_keyframes=100,
+        loop_closure_threshold=0.85,
+        loop_closure_min_frame_gap=30,
+        loop_closure_keyframe_interval=10,
         **croco_kwargs,
     ):
         super().__init__()
@@ -146,6 +153,13 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.keyframe_memory_lambda_time = keyframe_memory_lambda_time
         self.keyframe_memory_top_k = keyframe_memory_top_k
         self.keyframe_memory_max_size = keyframe_memory_max_size
+        self.keyframe_memory_diversity_threshold = keyframe_memory_diversity_threshold
+        # Loop closure config
+        self.enable_loop_closure = enable_loop_closure
+        self.loop_closure_max_keyframes = loop_closure_max_keyframes
+        self.loop_closure_threshold = loop_closure_threshold
+        self.loop_closure_min_frame_gap = loop_closure_min_frame_gap
+        self.loop_closure_keyframe_interval = loop_closure_keyframe_interval
         self.croco_kwargs = croco_kwargs
 
 
@@ -268,50 +282,130 @@ class LocalMemory(nn.Module):
 class KeyframeMemoryBank:
     """
     Keyframe Memory Bank for storing and retrieving keyframe features.
-    
+
     Stores global image features and pose features with timestamps,
-    and provides similarity-based retrieval using cosine and time similarity.
+    and provides diversity-based retrieval using cosine similarity.
+
+    Key design changes (inspired by InfiniteVGGT):
+    - Diversity sampling: only add frames that are sufficiently different from existing keyframes
+    - Diversity retrieval: retrieve low-similarity frames to provide diverse constraints
     """
-    
-    def __init__(self, max_size=None, device='cuda'):
+
+    def __init__(self, max_size=None, device='cuda', diversity_threshold=0.9, min_interval=10):
         """
         Initialize the Keyframe Memory Bank.
-        
+
         Args:
             max_size: Maximum number of keyframes to store (None for unlimited)
             device: Device to store tensors on
+            diversity_threshold: Only add frames with max similarity below this threshold (default 0.9)
+            min_interval: Minimum frame interval between keyframes (force add if exceeded)
         """
         self.max_size = max_size
         self.device = device
+        self.diversity_threshold = diversity_threshold
+        self.min_interval = min_interval
         self.features = []  # List of [B, 1, C] tensors
         self.pose_features = []  # List of [B, 1, C] tensors
         self.timestamps = []  # List of frame indices
         self.size = 0
     
-    def add(self, frame_idx, global_feat, pose_feat):
+    def add(self, frame_idx, global_feat, pose_feat, force_add=False):
         """
-        Add a keyframe to the memory bank.
-        
+        Add a keyframe to the memory bank with diversity check.
+
+        Only adds the frame if it's sufficiently different from existing keyframes
+        (max cosine similarity < diversity_threshold), unless force_add=True.
+
         Args:
             frame_idx: Frame index (timestamp)
             global_feat: [B, 1, C] global image feature
             pose_feat: [B, 1, C] pose feature
+            force_add: If True, skip diversity check (e.g., for first frame)
+
+        Returns:
+            bool: True if frame was added, False if rejected due to high similarity
         """
         # Move to device if needed
         global_feat = global_feat.to(self.device)
         pose_feat = pose_feat.to(self.device)
-        
+
+        # Diversity check: only add if sufficiently different from existing keyframes
+        # OR if enough time has passed since last keyframe (min_interval)
+        if not force_add and self.size > 0:
+            max_sim = self._compute_max_similarity(global_feat)
+            last_timestamp = self.timestamps[-1] if self.timestamps else 0
+            time_since_last = frame_idx - last_timestamp
+
+            # Force add if min_interval exceeded (temporal sampling)
+            if time_since_last >= self.min_interval:
+                if frame_idx % 50 == 0:
+                    print(f"[KMB] Frame {frame_idx}: Force adding (interval={time_since_last} >= {self.min_interval})")
+            elif max_sim >= self.diversity_threshold:
+                # Too similar and not enough time passed, skip
+                if frame_idx % 50 == 0:
+                    print(f"[KMB Debug] Frame {frame_idx}: Skipped (max_sim={max_sim:.4f} >= {self.diversity_threshold})")
+                return False
+            else:
+                if frame_idx % 50 == 0:
+                    print(f"[KMB] Frame {frame_idx}: Adding (max_sim={max_sim:.4f} < {self.diversity_threshold})")
+
         self.features.append(global_feat.detach().clone())
         self.pose_features.append(pose_feat.detach().clone())
         self.timestamps.append(frame_idx)
         self.size += 1
-        
-        # If max_size is set and exceeded, remove oldest frame (FIFO)
+
+        # If max_size is set and exceeded, remove most redundant frame (highest similarity to mean)
         if self.max_size is not None and self.size > self.max_size:
-            self.features.pop(0)
-            self.pose_features.pop(0)
-            self.timestamps.pop(0)
-            self.size -= 1
+            self._evict_most_redundant()
+
+        return True
+
+    def _compute_max_similarity(self, query_feat):
+        """
+        Compute maximum cosine similarity between query and all existing keyframes.
+
+        Args:
+            query_feat: [B, 1, C] query feature
+
+        Returns:
+            float: Maximum similarity score
+        """
+        max_sim = -1.0
+        for i in range(self.size):
+            sim = self.compute_cosine_similarity(query_feat, self.features[i])
+            sim_val = sim.mean().item()  # Average over batch
+            if sim_val > max_sim:
+                max_sim = sim_val
+        return max_sim
+
+    def _evict_most_redundant(self):
+        """
+        Evict the most redundant keyframe (highest similarity to mean feature).
+        Inspired by InfiniteVGGT's eviction strategy.
+        """
+        if self.size <= 1:
+            return
+
+        # Compute mean feature
+        all_features = torch.cat(self.features, dim=1)  # [B, size, C]
+        mean_feat = all_features.mean(dim=1, keepdim=True)  # [B, 1, C]
+
+        # Find keyframe with highest similarity to mean (most redundant)
+        max_sim = -1.0
+        max_idx = 0
+        for i in range(self.size):
+            sim = self.compute_cosine_similarity(self.features[i], mean_feat)
+            sim_val = sim.mean().item()
+            if sim_val > max_sim:
+                max_sim = sim_val
+                max_idx = i
+
+        # Remove the most redundant keyframe
+        self.features.pop(max_idx)
+        self.pose_features.pop(max_idx)
+        self.timestamps.pop(max_idx)
+        self.size -= 1
     
     def compute_cosine_similarity(self, query_feat, bank_feat):
         """
@@ -387,41 +481,47 @@ class KeyframeMemoryBank:
     
     def retrieve_top_k(self, query_feat, query_time, k, lambda_time):
         """
-        Retrieve top-k most similar keyframes from the memory bank.
-        
+        Retrieve top-k most DIVERSE keyframes from the memory bank.
+
+        Strategy: Select keyframes with LOWEST similarity to current frame,
+        providing diverse constraints rather than redundant nearby frames.
+        (Inspired by InfiniteVGGT's diversity-based selection)
+
         Args:
             query_feat: [B, 1, C] query feature
             query_time: Scalar query timestamp (frame index)
-            k: Number of top keyframes to retrieve
-            lambda_time: Weight for time similarity
-            
+            k: Number of keyframes to retrieve
+            lambda_time: Weight for time penalty (now penalizes nearby frames)
+
         Returns:
-            keyframe_features: [B, K, 2*C] concatenated [global_feat, pose_feat] for top-k keyframes
-            indices: List of indices of top-k keyframes
+            keyframe_features: [B, K, 2*C] concatenated [global_feat, pose_feat] for top-k diverse keyframes
+            indices: List of indices of selected keyframes
         """
         if self.size == 0:
             return None, []
-        
-        # Compute hybrid similarities for all keyframes
-        similarities = self.compute_hybrid_similarity(query_feat, query_time, lambda_time)
-        
+
+        # Compute cosine similarities for all keyframes (without time component for diversity)
+        device = query_feat.device
+        similarities = []
+        for i in range(self.size):
+            cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])  # [B, 1]
+            similarities.append(cos_sim)
+
         if len(similarities) == 0:
             return None, []
-        
+
         # Stack similarities: [size, B, 1]
         sim_stack = torch.stack(similarities, dim=0)  # [size, B, 1]
         sim_stack = sim_stack.squeeze(-1)  # [size, B]
-        
-        # Get top-k indices (along the size dimension)
-        # For batch processing, we take top-k for each batch item
-        # But typically B=1, so we can simplify
-        # Take top-k for the first (and typically only) batch item
-        top_k_values, top_k_indices = torch.topk(sim_stack[:, 0], k=min(k, self.size), dim=0)
+
+        # DIVERSITY: Select LOWEST similarity frames (using -sim_stack for topk)
+        # This provides diverse constraints instead of redundant nearby frames
+        _, top_k_indices = torch.topk(-sim_stack[:, 0], k=min(k, self.size), dim=0)
         top_k_indices = top_k_indices.cpu().tolist()
         if not isinstance(top_k_indices, list):
             top_k_indices = [top_k_indices]
-        
-        # Retrieve top-k keyframe features
+
+        # Retrieve selected keyframe features
         # Concatenate global_feat and pose_feat: [B, 1, C] + [B, 1, C] -> [B, 1, 2*C]
         keyframe_features_list = []
         for idx in top_k_indices:
@@ -430,7 +530,7 @@ class KeyframeMemoryBank:
             # Concatenate along feature dimension
             combined = torch.cat([global_feat, pose_feat], dim=-1)  # [B, 1, 2*C]
             keyframe_features_list.append(combined)
-        
+
         if len(keyframe_features_list) > 0:
             # Stack: [K, B, 1, 2*C] -> [B, K, 1, 2*C] -> [B, K, 2*C]
             keyframe_features = torch.stack(keyframe_features_list, dim=0)  # [K, B, 1, 2*C]
@@ -438,7 +538,7 @@ class KeyframeMemoryBank:
             keyframe_features = keyframe_features.squeeze(2)  # [B, K, 2*C]
         else:
             keyframe_features = None
-        
+
         return keyframe_features, top_k_indices
     
     def clear(self):
@@ -447,6 +547,304 @@ class KeyframeMemoryBank:
         self.pose_features = []
         self.timestamps = []
         self.size = 0
+
+
+class LoopClosureKeyframeDB(nn.Module):
+    """
+    Keyframe database for loop closure detection.
+    Stores keyframe features, poses, and memory states for matching and recall.
+    """
+    def __init__(self, max_keyframes=100, feat_dim=1024, state_dim=768, state_size=324, mem_size=256, mem_dim=1536):
+        super().__init__()
+        self.max_keyframes = max_keyframes
+        self.feat_dim = feat_dim
+        self.state_dim = state_dim
+        self.state_size = state_size
+        self.mem_size = mem_size
+        self.mem_dim = mem_dim
+        # Runtime buffers (not learnable parameters)
+        self.register_buffer('features', torch.zeros(1, max_keyframes, feat_dim))
+        self.register_buffer('poses', torch.zeros(1, max_keyframes, 7))
+        self.register_buffer('frame_ids', torch.zeros(1, max_keyframes, dtype=torch.long))
+        self.register_buffer('count', torch.zeros(1, dtype=torch.long))
+        # Memory state storage (for memory recall)
+        self.state_feats = None  # Will be initialized in reset()
+        self.mems = None         # Will be initialized in reset()
+
+    def reset(self, batch_size, device=None):
+        """Reset database for new sequence"""
+        if device is None:
+            device = self.features.device
+        self.features = torch.zeros(batch_size, self.max_keyframes, self.feat_dim, device=device)
+        self.poses = torch.zeros(batch_size, self.max_keyframes, 7, device=device)
+        self.frame_ids = torch.zeros(batch_size, self.max_keyframes, dtype=torch.long, device=device)
+        self.count = torch.zeros(batch_size, dtype=torch.long, device=device)
+        # Initialize memory state storage
+        self.state_feats = torch.zeros(batch_size, self.max_keyframes, self.state_size, self.state_dim, device=device)
+        self.mems = torch.zeros(batch_size, self.max_keyframes, self.mem_size, self.mem_dim, device=device)
+
+    def add_keyframe(self, feat, pose, frame_id, state_feat=None, mem=None, batch_mask=None):
+        """
+        Add keyframe to database with optional memory state
+        Args:
+            feat: [B, 1, feat_dim] global image feature
+            pose: [B, 7] camera pose (tx, ty, tz, qw, qx, qy, qz)
+            frame_id: int, current frame index
+            state_feat: [B, state_size, state_dim] global state (optional)
+            mem: [B, mem_size, mem_dim] local memory (optional)
+            batch_mask: [B] optional mask for which batches to update
+        """
+        B = feat.shape[0]
+        for b in range(B):
+            if batch_mask is not None and not batch_mask[b]:
+                continue
+            idx = self.count[b] % self.max_keyframes
+            self.features[b, idx] = feat[b, 0]
+            self.poses[b, idx] = pose[b]
+            self.frame_ids[b, idx] = frame_id
+            # Save memory state if provided
+            if state_feat is not None and self.state_feats is not None:
+                self.state_feats[b, idx] = state_feat[b].detach()
+            if mem is not None and self.mems is not None:
+                self.mems[b, idx] = mem[b].detach()
+            self.count[b] += 1
+
+    def get_memory(self, batch_idx, keyframe_idx):
+        """
+        Retrieve memory state for a specific keyframe
+        Args:
+            batch_idx: batch index
+            keyframe_idx: keyframe slot index (not frame_id)
+        Returns:
+            state_feat: [state_size, state_dim] or None
+            mem: [mem_size, mem_dim] or None
+        """
+        if self.state_feats is None or self.mems is None:
+            return None, None
+        return self.state_feats[batch_idx, keyframe_idx], self.mems[batch_idx, keyframe_idx]
+
+    def query(self, feat, top_k=5):
+        """
+        Query most similar keyframes
+        Args:
+            feat: [B, 1, feat_dim] query feature
+            top_k: number of candidates to return
+        Returns:
+            top_sim: [B, top_k] similarity scores
+            top_idx: [B, top_k] keyframe indices (slot indices, not frame_ids)
+            top_poses: [B, top_k, 7] keyframe poses
+            top_frame_ids: [B, top_k] keyframe frame indices
+        """
+        B = feat.shape[0]
+        # Normalize features for cosine similarity
+        feat_norm = F.normalize(feat[:, 0], dim=-1)  # [B, feat_dim]
+        db_norm = F.normalize(self.features, dim=-1)  # [B, max_kf, feat_dim]
+
+        # Compute similarities
+        similarities = torch.bmm(feat_norm.unsqueeze(1), db_norm.transpose(1, 2)).squeeze(1)
+        # [B, max_kf]
+
+        # Mask unused slots
+        valid_mask = torch.arange(self.max_keyframes, device=feat.device).unsqueeze(0) < self.count.unsqueeze(1)
+        similarities = similarities.masked_fill(~valid_mask, -1e9)
+
+        # Get top-k
+        actual_k = min(top_k, self.max_keyframes)
+        top_sim, top_idx = similarities.topk(actual_k, dim=-1)
+
+        # Gather corresponding poses and frame ids
+        top_poses = torch.gather(self.poses, 1, top_idx.unsqueeze(-1).expand(-1, -1, 7))
+        top_frame_ids = torch.gather(self.frame_ids, 1, top_idx)
+
+        return top_sim, top_idx, top_poses, top_frame_ids
+
+    def query_with_memory(self, feat, current_frame_id, min_frame_gap=30, threshold=0.85):
+        """
+        Query for loop closure and return matching memory state
+        Args:
+            feat: [B, 1, feat_dim] query feature
+            current_frame_id: current frame index
+            min_frame_gap: minimum frame gap to consider as loop
+            threshold: similarity threshold for loop detection
+        Returns:
+            loop_detected: [B] bool tensor
+            best_state_feat: [B, state_size, state_dim] or None
+            best_mem: [B, mem_size, mem_dim] or None
+            confidence: [B] confidence scores
+            matched_frame_id: [B] matched frame ids
+        """
+        B = feat.shape[0]
+        device = feat.device
+
+        # Query top-k keyframes
+        top_sim, top_idx, top_poses, top_frame_ids = self.query(feat, top_k=5)
+
+        # Check temporal gap
+        frame_gap = current_frame_id - top_frame_ids
+        valid_gap = frame_gap >= min_frame_gap
+
+        # Select best valid match
+        masked_sim = top_sim.masked_fill(~valid_gap, -1e9)
+        best_sim, best_local_idx = masked_sim.max(dim=-1)  # [B]
+
+        # Get the actual keyframe slot index
+        batch_idx = torch.arange(B, device=device)
+        best_slot_idx = top_idx[batch_idx, best_local_idx]  # [B]
+        matched_frame_id = top_frame_ids[batch_idx, best_local_idx]  # [B]
+
+        # Determine if loop is detected
+        loop_detected = best_sim > threshold
+        confidence = torch.clamp(best_sim, 0.0, 1.0)
+
+        # Retrieve memory states for detected loops
+        best_state_feat = None
+        best_mem = None
+        if loop_detected.any() and self.state_feats is not None:
+            # Gather memory states for all batches (will mask later)
+            best_state_feat = self.state_feats[batch_idx, best_slot_idx]  # [B, state_size, state_dim]
+            best_mem = self.mems[batch_idx, best_slot_idx]  # [B, mem_size, mem_dim]
+
+        return loop_detected, best_state_feat, best_mem, confidence, matched_frame_id
+
+
+class LoopDetector(nn.Module):
+    """
+    Detect loop closure based on feature similarity (no learnable parameters).
+
+    Uses cosine similarity between current frame features and keyframe database
+    to detect when the camera returns to a previously visited location.
+    """
+    def __init__(self, feat_dim=1024, threshold=0.85, min_frame_gap=30):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.threshold = threshold
+        self.min_frame_gap = min_frame_gap
+
+    def forward(self, current_feat, keyframe_db, current_frame_id):
+        """
+        Detect loop closure
+        Args:
+            current_feat: [B, 1, feat_dim] current frame feature
+            keyframe_db: LoopClosureKeyframeDB instance
+            current_frame_id: int, current frame index
+        Returns:
+            loop_detected: [B] bool tensor
+            loop_frame_id: [B] matched frame id
+            loop_pose: [B, 7] matched pose
+            confidence: [B] confidence score
+        """
+        B = current_feat.shape[0]
+        device = current_feat.device
+
+        # Query keyframe database
+        top_sim, top_idx, top_poses, top_frame_ids = keyframe_db.query(current_feat, top_k=5)
+
+        # Check temporal gap (avoid matching recent frames)
+        frame_gap = current_frame_id - top_frame_ids  # [B, 5]
+        valid_gap = frame_gap >= self.min_frame_gap
+
+        # Select best valid match
+        masked_sim = top_sim.masked_fill(~valid_gap, -1e9)
+        best_sim, best_idx = masked_sim.max(dim=-1)  # [B]
+
+        # Get corresponding pose and frame id
+        batch_idx = torch.arange(B, device=device)
+        loop_pose = top_poses[batch_idx, best_idx]  # [B, 7]
+        loop_frame_id = top_frame_ids[batch_idx, best_idx]  # [B]
+
+        # Determine if loop is detected
+        loop_detected = best_sim > self.threshold
+
+        # Confidence is the similarity score (clamped)
+        confidence = torch.clamp(best_sim, 0.0, 1.0)
+
+        return loop_detected, loop_frame_id, loop_pose, confidence
+
+
+class LoopCorrector(nn.Module):
+    """
+    Geometric loop closure corrector (no learnable parameters).
+
+    When a loop is detected, this module applies a soft correction to the
+    state and memory based on the pose discrepancy. The idea is that when
+    we return to a previously visited location, we should partially reset
+    our accumulated state to reduce drift.
+    """
+    def __init__(self, state_dim=768, mem_dim=1536, pose_dim=7,
+                 state_correction_strength=0.3, mem_correction_strength=0.2):
+        super().__init__()
+        self.state_dim = state_dim
+        self.mem_dim = mem_dim
+        # Hyperparameters (not learned)
+        self.state_correction_strength = state_correction_strength
+        self.mem_correction_strength = mem_correction_strength
+
+    def _compute_pose_error(self, current_pose, loop_pose):
+        """
+        Compute pose error magnitude between current and loop pose.
+
+        Args:
+            current_pose: [B, 7] (tx, ty, tz, qw, qx, qy, qz)
+            loop_pose: [B, 7]
+
+        Returns:
+            error: [B] normalized pose error in [0, 1]
+        """
+        # Translation error (L2 distance)
+        trans_current = current_pose[:, :3]
+        trans_loop = loop_pose[:, :3]
+        trans_error = torch.norm(trans_current - trans_loop, dim=-1)
+
+        # Rotation error (quaternion distance)
+        quat_current = F.normalize(current_pose[:, 3:], dim=-1)
+        quat_loop = F.normalize(loop_pose[:, 3:], dim=-1)
+        # Quaternion dot product gives cos(angle/2)
+        quat_dot = torch.abs(torch.sum(quat_current * quat_loop, dim=-1))
+        rot_error = 1.0 - quat_dot  # 0 when identical, 1 when opposite
+
+        # Combine errors (normalize translation by typical scale)
+        combined_error = trans_error / (trans_error.mean() + 1e-6) * 0.5 + rot_error * 0.5
+        return torch.clamp(combined_error, 0.0, 1.0)
+
+    def forward(self, state_feat, mem, current_pose, loop_pose, confidence):
+        """
+        Apply geometric loop closure correction.
+
+        When a loop is detected with high confidence but the poses differ,
+        we apply a soft correction that blends the current state towards
+        a more neutral value, effectively reducing accumulated drift.
+
+        Args:
+            state_feat: [B, state_size, state_dim] global state
+            mem: [B, mem_size, mem_dim] local memory
+            current_pose: [B, 7] current estimated pose
+            loop_pose: [B, 7] matched loop pose
+            confidence: [B] detection confidence
+
+        Returns:
+            corrected_state: [B, state_size, state_dim]
+            corrected_mem: [B, mem_size, mem_dim]
+        """
+        # Compute pose discrepancy
+        pose_error = self._compute_pose_error(current_pose, loop_pose)
+
+        # Correction strength: high confidence + high error = strong correction
+        # The intuition: if we're confident we've returned to a place but our
+        # pose estimate differs significantly, we have accumulated drift
+        correction_factor = confidence * pose_error  # [B]
+        correction_factor = correction_factor[:, None, None]  # [B, 1, 1]
+
+        # Apply soft reset to state (blend towards mean)
+        state_mean = state_feat.mean(dim=(1, 2), keepdim=True)
+        state_correction = self.state_correction_strength * correction_factor
+        corrected_state = state_feat * (1 - state_correction) + state_mean * state_correction
+
+        # Apply soft reset to memory (blend towards mean)
+        mem_mean = mem.mean(dim=(1, 2), keepdim=True)
+        mem_correction = self.mem_correction_strength * correction_factor
+        corrected_mem = mem * (1 - mem_correction) + mem_mean * mem_correction
+
+        return corrected_state, corrected_mem
 
 
 class ARCroco3DStereo(CroCoNet):
@@ -460,11 +858,13 @@ class ARCroco3DStereo(CroCoNet):
         config.croco_kwargs = fill_default_args(
             config.croco_kwargs, CrocoConfig.__init__
         )
-        self.config = config
         self.patch_embed_cls = config.patch_embed_cls
         self.croco_args = config.croco_kwargs
         croco_cfg = CrocoConfig(**self.croco_args)
         super().__init__(croco_cfg)
+        # CRITICAL FIX: PreTrainedModel.__init__ overwrites self.config with croco_cfg
+        # We must restore the original ARCroco3DStereoConfig after super().__init__
+        self.config = config
         self.enc_blocks_ray_map = nn.ModuleList(
             [
                 Block(
@@ -533,15 +933,46 @@ class ARCroco3DStereo(CroCoNet):
         if config.use_keyframe_memory_bank:
             self.keyframe_memory_bank = KeyframeMemoryBank(
                 max_size=config.keyframe_memory_max_size,
-                device='cuda'  # Will be set properly during inference
+                device='cuda',  # Will be set properly during inference
+                diversity_threshold=config.keyframe_memory_diversity_threshold,
+                min_interval=getattr(config, 'keyframe_memory_min_interval', 10)
             )
         else:
             self.keyframe_memory_bank = None
 
+        # Initialize Loop Closure components if enabled
+        if config.enable_loop_closure and self.pose_head_flag:
+            self.loop_closure_keyframe_db = LoopClosureKeyframeDB(
+                max_keyframes=config.loop_closure_max_keyframes,
+                feat_dim=self.enc_embed_dim,
+                state_dim=self.dec_embed_dim,
+                state_size=config.state_size,
+                mem_size=config.local_mem_size,
+                mem_dim=self.dec_embed_dim * 2,  # mem uses 2*v_dim
+            )
+            self.loop_detector = LoopDetector(
+                feat_dim=self.enc_embed_dim,
+                threshold=config.loop_closure_threshold,
+                min_frame_gap=config.loop_closure_min_frame_gap,
+            )
+            self.loop_corrector = LoopCorrector(
+                state_dim=self.dec_embed_dim,
+                mem_dim=self.dec_embed_dim * 2,  # mem is 2*v_dim
+                pose_dim=7,
+            )
+            # Store loop closure information for visualization
+            self.loop_closures = []
+        else:
+            self.loop_closure_keyframe_db = None
+            self.loop_detector = None
+            self.loop_corrector = None
+            self.loop_closures = []
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kw):
         if os.path.isfile(pretrained_model_name_or_path):
-            return load_model(pretrained_model_name_or_path, device="cpu")
+            model = load_model(pretrained_model_name_or_path, device="cpu")
+            return model
         else:
             try:
                 model = super(ARCroco3DStereo, cls).from_pretrained(
@@ -1442,6 +1873,9 @@ class ARCroco3DStereo(CroCoNet):
             else:
                 reset_mask_bool = False
 
+            # Check if loop closure is enabled
+            _enable_lc = getattr(self.config, 'enable_loop_closure', False)
+
             if i == 0:
                 state_feat, state_pos = self._init_state(feat_i, pos_i)
                 mem = self.pose_retriever.mem.expand(feat_i.shape[0], -1, -1)
@@ -1450,6 +1884,10 @@ class ARCroco3DStereo(CroCoNet):
                 # Initialize Keyframe Memory Bank device (but don't clear - preserve long-term memory)
                 if self.keyframe_memory_bank is not None:
                     self.keyframe_memory_bank.device = device
+                # Reset loop closure keyframe DB for new sequence
+                if _enable_lc and self.loop_closure_keyframe_db is not None:
+                    self.loop_closure_keyframe_db.reset(feat_i.shape[0], device=feat_i.device)
+                    self.loop_closures = []  # Clear previous loop closures
 
             # NOTE: Keyframe Memory Bank is NOT cleared on reset - it serves as long-term memory
             # that persists across segments to help with re-localization
@@ -1514,13 +1952,18 @@ class ARCroco3DStereo(CroCoNet):
 
             # Add current frame to Keyframe Memory Bank if enabled
             # Project global_feat to match memory format (proj_q projects to v_dim)
+            # Use diversity-based sampling: only add if sufficiently different from existing keyframes
             if self.keyframe_memory_bank is not None and self.pose_head_flag:
                 proj_global_feat = self.pose_retriever.proj_q(global_img_feat_i)
-                self.keyframe_memory_bank.add(
+                # First frame is always added (force_add=True), others use diversity check
+                added = self.keyframe_memory_bank.add(
                     frame_idx=i,
                     global_feat=proj_global_feat,
-                    pose_feat=out_pose_feat_i
+                    pose_feat=out_pose_feat_i,
+                    force_add=(i == 0)  # Always add first frame as anchor
                 )
+                if added and i % 50 == 0:
+                    print(f"[KMB] Frame {i}: Added to memory bank (size={self.keyframe_memory_bank.size})")
 
             # update mem
             new_mem = self.pose_retriever.update_mem(
@@ -1535,6 +1978,66 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth].float(),
             ]
             res = self._downstream_head(head_input, shape, pos=pos_i)
+
+            # Loop closure detection and memory recall (inference only)
+            if _enable_lc and self.pose_head_flag and i > 0 and self.loop_closure_keyframe_db is not None:
+                current_pose_enc = res.get("camera_pose", None)
+                if current_pose_enc is not None:
+                    # Convert pose encoding to 7-dim pose (tx, ty, tz, qw, qx, qy, qz)
+                    from src.dust3r.utils.camera import pose_encoding_to_camera
+                    current_pose_mat = pose_encoding_to_camera(current_pose_enc.clone())  # [B, 4, 4]
+                    # Extract translation and rotation (as quaternion)
+                    trans = current_pose_mat[:, :3, 3]  # [B, 3]
+                    rot_mat = current_pose_mat[:, :3, :3]  # [B, 3, 3]
+                    # Convert rotation matrix to quaternion
+                    import roma
+                    quat = roma.rotmat_to_unitquat(rot_mat)  # [B, 4] (x, y, z, w)
+                    # Reorder to (w, x, y, z) for consistency
+                    quat = torch.cat([quat[:, 3:4], quat[:, :3]], dim=-1)  # [B, 4]
+                    current_pose_7d = torch.cat([trans, quat], dim=-1)  # [B, 7]
+
+                    # Detect loop closure with memory recall
+                    _threshold = getattr(self.config, 'loop_closure_threshold', 0.85)
+                    _min_gap = getattr(self.config, 'loop_closure_min_frame_gap', 30)
+                    loop_detected, hist_state_feat, hist_mem, confidence, matched_frame_id = \
+                        self.loop_closure_keyframe_db.query_with_memory(
+                            global_img_feat_i, i, min_frame_gap=_min_gap, threshold=_threshold
+                        )
+
+                    # Apply memory recall if loop is detected
+                    if loop_detected.any() and hist_state_feat is not None and hist_mem is not None:
+                        # Memory fusion: blend current state with historical state
+                        # Higher confidence = more weight to historical memory
+                        blend_weight = confidence * loop_detected.float()  # [B]
+                        blend_weight = blend_weight[:, None, None]  # [B, 1, 1]
+
+                        # Fuse state_feat: current * (1-w) + historical * w
+                        new_state_feat = new_state_feat * (1 - blend_weight * 0.3) + hist_state_feat * (blend_weight * 0.3)
+                        # Fuse mem: current * (1-w) + historical * w
+                        new_mem = new_mem * (1 - blend_weight * 0.3) + hist_mem * (blend_weight * 0.3)
+
+                        # Store loop closure information for visualization
+                        conf_val = confidence.item() if isinstance(confidence, torch.Tensor) else confidence
+                        frame_id_val = matched_frame_id.item() if isinstance(matched_frame_id, torch.Tensor) else matched_frame_id
+
+                        self.loop_closures.append({
+                            'current_idx': i,
+                            'matched_idx': int(frame_id_val),
+                            'confidence': float(conf_val),
+                        })
+                        print(f"[Loop Closure + Memory Recall] Frame {i}: Recalled memory from frame {int(frame_id_val)} (confidence={conf_val:.3f}, blend={conf_val*0.3:.3f})")
+
+                    # Add keyframe at fixed intervals (with memory state)
+                    _kf_interval = getattr(self.config, 'loop_closure_keyframe_interval', 10)
+                    if i % _kf_interval == 0:
+                        self.loop_closure_keyframe_db.add_keyframe(
+                            global_img_feat_i,
+                            current_pose_7d,
+                            i,
+                            state_feat=new_state_feat,  # Save current state
+                            mem=new_mem,                 # Save current memory
+                        )
+
             res_cpu = to_cpu(res)
             ress.append(res_cpu)
             img_mask = view["img_mask"]
