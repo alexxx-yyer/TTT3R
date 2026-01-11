@@ -128,6 +128,10 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         loop_closure_threshold=0.85,
         loop_closure_min_frame_gap=30,
         loop_closure_keyframe_interval=10,
+        # Depth consistency config
+        use_depth_consistency=False,
+        depth_consistency_top_k=3,
+        depth_consistency_weight=0.5,
         **croco_kwargs,
     ):
         super().__init__()
@@ -160,6 +164,10 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.loop_closure_threshold = loop_closure_threshold
         self.loop_closure_min_frame_gap = loop_closure_min_frame_gap
         self.loop_closure_keyframe_interval = loop_closure_keyframe_interval
+        # Depth consistency config
+        self.use_depth_consistency = use_depth_consistency
+        self.depth_consistency_top_k = depth_consistency_top_k
+        self.depth_consistency_weight = depth_consistency_weight
         self.croco_kwargs = croco_kwargs
 
 
@@ -281,117 +289,131 @@ class LocalMemory(nn.Module):
 
 class KeyframeMemoryBank:
     """
-    Keyframe Memory Bank for storing and retrieving keyframe features.
+    Enhanced Keyframe Memory Bank for storing and retrieving keyframe information.
 
-    Stores global image features and pose features with timestamps,
-    and provides diversity-based retrieval using cosine similarity.
+    Stores:
+    - Global image features and pose features (for pose estimation)
+    - Depth predictions and confidence maps (for depth consistency)
+    - Camera poses (for geometric projection)
 
-    Key design changes (inspired by InfiniteVGGT):
-    - Diversity sampling: only add frames that are sufficiently different from existing keyframes
-    - Diversity retrieval: retrieve low-similarity frames to provide diverse constraints
+    Provides:
+    - Diversity-based retrieval (for pose estimation - find different viewpoints)
+    - Similarity-based retrieval (for depth consistency - find overlapping views)
+    - Depth consistency constraint with confidence weighting
     """
 
     def __init__(self, max_size=None, device='cuda', diversity_threshold=0.9, min_interval=10):
         """
-        Initialize the Keyframe Memory Bank.
+        Initialize the Enhanced Keyframe Memory Bank.
 
         Args:
             max_size: Maximum number of keyframes to store (None for unlimited)
             device: Device to store tensors on
-            diversity_threshold: Only add frames with max similarity below this threshold (default 0.9)
-            min_interval: Minimum frame interval between keyframes (force add if exceeded)
+            diversity_threshold: Only add frames with max similarity below this threshold
+            min_interval: Minimum frame interval between keyframes
         """
         self.max_size = max_size
         self.device = device
         self.diversity_threshold = diversity_threshold
         self.min_interval = min_interval
-        self.features = []  # List of [B, 1, C] tensors
-        self.pose_features = []  # List of [B, 1, C] tensors
-        self.timestamps = []  # List of frame indices
+
+        # Original features (for pose estimation)
+        self.features = []           # List of [B, 1, C] global features
+        self.pose_features = []      # List of [B, 1, C] pose features
+        self.timestamps = []         # List of frame indices
+
+        # New: Geometric information (for depth consistency)
+        self.depths = []             # List of [B, H, W] depth maps
+        self.confs = []              # List of [B, H, W] confidence maps
+        self.camera_poses = []       # List of [B, 4, 4] camera poses (c2w)
+        self.pts3d = []              # List of [B, H, W, 3] 3D points in world coords
+
         self.size = 0
-    
-    def add(self, frame_idx, global_feat, pose_feat, force_add=False):
+
+    def add(self, frame_idx, global_feat, pose_feat,
+            depth=None, conf=None, camera_pose=None, pts3d=None, force_add=False):
         """
         Add a keyframe to the memory bank with diversity check.
-
-        Only adds the frame if it's sufficiently different from existing keyframes
-        (max cosine similarity < diversity_threshold), unless force_add=True.
 
         Args:
             frame_idx: Frame index (timestamp)
             global_feat: [B, 1, C] global image feature
             pose_feat: [B, 1, C] pose feature
-            force_add: If True, skip diversity check (e.g., for first frame)
+            depth: [B, H, W] depth map (optional)
+            conf: [B, H, W] confidence map (optional)
+            camera_pose: [B, 4, 4] camera pose c2w (optional)
+            pts3d: [B, H, W, 3] 3D points in world coords (optional)
+            force_add: If True, skip diversity check
 
         Returns:
-            bool: True if frame was added, False if rejected due to high similarity
+            bool: True if frame was added, False if rejected
         """
-        # Move to device if needed
         global_feat = global_feat.to(self.device)
         pose_feat = pose_feat.to(self.device)
 
-        # Diversity check: only add if sufficiently different from existing keyframes
-        # OR if enough time has passed since last keyframe (min_interval)
+        # Diversity check
         if not force_add and self.size > 0:
             max_sim = self._compute_max_similarity(global_feat)
             last_timestamp = self.timestamps[-1] if self.timestamps else 0
             time_since_last = frame_idx - last_timestamp
 
-            # Force add if min_interval exceeded (temporal sampling)
             if time_since_last >= self.min_interval:
-                if frame_idx % 50 == 0:
-                    print(f"[KMB] Frame {frame_idx}: Force adding (interval={time_since_last} >= {self.min_interval})")
+                pass  # Force add due to time interval
             elif max_sim >= self.diversity_threshold:
-                # Too similar and not enough time passed, skip
-                if frame_idx % 50 == 0:
-                    print(f"[KMB Debug] Frame {frame_idx}: Skipped (max_sim={max_sim:.4f} >= {self.diversity_threshold})")
-                return False
-            else:
-                if frame_idx % 50 == 0:
-                    print(f"[KMB] Frame {frame_idx}: Adding (max_sim={max_sim:.4f} < {self.diversity_threshold})")
+                return False  # Too similar, skip
 
+        # Add original features
         self.features.append(global_feat.detach().clone())
         self.pose_features.append(pose_feat.detach().clone())
         self.timestamps.append(frame_idx)
+
+        # Add geometric information (if provided)
+        if depth is not None:
+            self.depths.append(depth.detach().clone().to(self.device))
+        else:
+            self.depths.append(None)
+
+        if conf is not None:
+            self.confs.append(conf.detach().clone().to(self.device))
+        else:
+            self.confs.append(None)
+
+        if camera_pose is not None:
+            self.camera_poses.append(camera_pose.detach().clone().to(self.device))
+        else:
+            self.camera_poses.append(None)
+
+        if pts3d is not None:
+            self.pts3d.append(pts3d.detach().clone().to(self.device))
+        else:
+            self.pts3d.append(None)
+
         self.size += 1
 
-        # If max_size is set and exceeded, remove most redundant frame (highest similarity to mean)
+        # Evict if exceeds max_size
         if self.max_size is not None and self.size > self.max_size:
             self._evict_most_redundant()
 
         return True
 
     def _compute_max_similarity(self, query_feat):
-        """
-        Compute maximum cosine similarity between query and all existing keyframes.
-
-        Args:
-            query_feat: [B, 1, C] query feature
-
-        Returns:
-            float: Maximum similarity score
-        """
+        """Compute maximum cosine similarity between query and all existing keyframes."""
         max_sim = -1.0
         for i in range(self.size):
             sim = self.compute_cosine_similarity(query_feat, self.features[i])
-            sim_val = sim.mean().item()  # Average over batch
+            sim_val = sim.mean().item()
             if sim_val > max_sim:
                 max_sim = sim_val
         return max_sim
 
     def _evict_most_redundant(self):
-        """
-        Evict the most redundant keyframe (highest similarity to mean feature).
-        Inspired by InfiniteVGGT's eviction strategy.
-        """
+        """Evict the most redundant keyframe (highest similarity to mean)."""
         if self.size <= 1:
             return
 
-        # Compute mean feature
-        all_features = torch.cat(self.features, dim=1)  # [B, size, C]
-        mean_feat = all_features.mean(dim=1, keepdim=True)  # [B, 1, C]
+        all_features = torch.cat(self.features, dim=1)
+        mean_feat = all_features.mean(dim=1, keepdim=True)
 
-        # Find keyframe with highest similarity to mean (most redundant)
         max_sim = -1.0
         max_idx = 0
         for i in range(self.size):
@@ -401,151 +423,303 @@ class KeyframeMemoryBank:
                 max_sim = sim_val
                 max_idx = i
 
-        # Remove the most redundant keyframe
+        # Remove all data for this keyframe
         self.features.pop(max_idx)
         self.pose_features.pop(max_idx)
         self.timestamps.pop(max_idx)
+        self.depths.pop(max_idx)
+        self.confs.pop(max_idx)
+        self.camera_poses.pop(max_idx)
+        self.pts3d.pop(max_idx)
         self.size -= 1
-    
+
     def compute_cosine_similarity(self, query_feat, bank_feat):
-        """
-        Compute cosine similarity between query feature and bank feature.
-        
-        Formula: sim_cos = sum_p (F_i_p · X_hat_p^T) / (||F_i_p|| · ||X_hat_p||)
-        
-        Args:
-            query_feat: [B, 1, C] query feature
-            bank_feat: [B, 1, C] bank feature
-            
-        Returns:
-            [B, 1] cosine similarity scores
-        """
-        # Normalize features
-        query_norm = F.normalize(query_feat, p=2, dim=-1)  # [B, 1, C]
-        bank_norm = F.normalize(bank_feat, p=2, dim=-1)  # [B, 1, C]
-        
-        # Compute cosine similarity: dot product of normalized features
-        # Sum over feature dimension p
-        cosine_sim = (query_norm * bank_norm).sum(dim=-1, keepdim=True)  # [B, 1, 1]
-        return cosine_sim.squeeze(-1)  # [B, 1]
-    
-    def compute_time_similarity(self, query_time, bank_time, device):
-        """
-        Compute time similarity using Gaussian decay.
+        """Compute cosine similarity between query and bank feature."""
+        query_norm = F.normalize(query_feat, p=2, dim=-1)
+        bank_norm = F.normalize(bank_feat, p=2, dim=-1)
+        cosine_sim = (query_norm * bank_norm).sum(dim=-1, keepdim=True)
+        return cosine_sim.squeeze(-1)
 
-        Formula: sim_time = exp(-(time(F_i) - time(X_hat))^2)
+    # ==================== Dual Retrieval Strategy ====================
 
-        Args:
-            query_time: Scalar or tensor query timestamp
-            bank_time: Scalar or tensor bank timestamp
-            device: Device to create tensor on
-
-        Returns:
-            Time similarity score as tensor on specified device
+    def retrieve_diverse(self, query_feat, k):
         """
-        time_diff = query_time - bank_time
-        time_sim = torch.exp(torch.tensor(-(time_diff ** 2), dtype=torch.float32, device=device))
-        return time_sim
-
-    def compute_hybrid_similarity(self, query_feat, query_time, lambda_time):
-        """
-        Compute hybrid similarity for all keyframes in the bank.
-
-        Formula: sim_hybrid = sim_cos + lambda_time * sim_time
+        Retrieve top-k most DIVERSE keyframes (lowest similarity).
+        Use for: Pose estimation - provides global constraints from different viewpoints.
 
         Args:
             query_feat: [B, 1, C] query feature
-            query_time: Scalar query timestamp (frame index)
-            lambda_time: Weight for time similarity
-
-        Returns:
-            List of [B, 1] hybrid similarity scores for each keyframe
-        """
-        if self.size == 0:
-            return []
-
-        device = query_feat.device
-        similarities = []
-        for i in range(self.size):
-            # Compute cosine similarity
-            cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])  # [B, 1]
-
-            # Compute time similarity on same device as query_feat
-            time_sim = self.compute_time_similarity(query_time, self.timestamps[i], device)
-
-            # Compute hybrid similarity
-            hybrid_sim = cos_sim + lambda_time * time_sim
-            similarities.append(hybrid_sim)
-        
-        return similarities
-    
-    def retrieve_top_k(self, query_feat, query_time, k, lambda_time):
-        """
-        Retrieve top-k most DIVERSE keyframes from the memory bank.
-
-        Strategy: Select keyframes with LOWEST similarity to current frame,
-        providing diverse constraints rather than redundant nearby frames.
-        (Inspired by InfiniteVGGT's diversity-based selection)
-
-        Args:
-            query_feat: [B, 1, C] query feature
-            query_time: Scalar query timestamp (frame index)
             k: Number of keyframes to retrieve
-            lambda_time: Weight for time penalty (now penalizes nearby frames)
 
         Returns:
-            keyframe_features: [B, K, 2*C] concatenated [global_feat, pose_feat] for top-k diverse keyframes
-            indices: List of indices of selected keyframes
+            keyframe_features: [B, K, 2*C] concatenated features
+            indices: List of selected keyframe indices
         """
         if self.size == 0:
             return None, []
 
-        # Compute cosine similarities for all keyframes (without time component for diversity)
-        device = query_feat.device
         similarities = []
         for i in range(self.size):
-            cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])  # [B, 1]
+            cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])
             similarities.append(cos_sim)
 
-        if len(similarities) == 0:
-            return None, []
+        sim_stack = torch.stack(similarities, dim=0).squeeze(-1)  # [size, B]
 
-        # Stack similarities: [size, B, 1]
-        sim_stack = torch.stack(similarities, dim=0)  # [size, B, 1]
-        sim_stack = sim_stack.squeeze(-1)  # [size, B]
-
-        # DIVERSITY: Select LOWEST similarity frames (using -sim_stack for topk)
-        # This provides diverse constraints instead of redundant nearby frames
+        # Select LOWEST similarity (diverse)
         _, top_k_indices = torch.topk(-sim_stack[:, 0], k=min(k, self.size), dim=0)
         top_k_indices = top_k_indices.cpu().tolist()
         if not isinstance(top_k_indices, list):
             top_k_indices = [top_k_indices]
 
-        # Retrieve selected keyframe features
-        # Concatenate global_feat and pose_feat: [B, 1, C] + [B, 1, C] -> [B, 1, 2*C]
+        keyframe_features = self._gather_features(top_k_indices)
+        return keyframe_features, top_k_indices
+
+    def retrieve_similar(self, query_feat, k, min_frame_gap=10):
+        """
+        Retrieve top-k most SIMILAR keyframes (highest similarity).
+        Use for: Depth consistency - finds overlapping views for geometric constraints.
+
+        Args:
+            query_feat: [B, 1, C] query feature
+            k: Number of keyframes to retrieve
+            min_frame_gap: Minimum frame gap to avoid too recent frames
+
+        Returns:
+            indices: List of selected keyframe indices
+            similarities: Similarity scores for selected keyframes
+        """
+        if self.size == 0:
+            return [], []
+
+        similarities = []
+        valid_indices = []
+
+        # Get current frame index (approximate from timestamps)
+        current_time = self.timestamps[-1] + 1 if self.timestamps else 0
+
+        for i in range(self.size):
+            # Skip too recent frames
+            if current_time - self.timestamps[i] < min_frame_gap:
+                continue
+            cos_sim = self.compute_cosine_similarity(query_feat, self.features[i])
+            similarities.append(cos_sim.mean().item())
+            valid_indices.append(i)
+
+        if len(valid_indices) == 0:
+            return [], []
+
+        # Sort by similarity (descending) and take top-k
+        sorted_pairs = sorted(zip(similarities, valid_indices), reverse=True)
+        top_k = sorted_pairs[:min(k, len(sorted_pairs))]
+
+        selected_indices = [idx for _, idx in top_k]
+        selected_sims = [sim for sim, _ in top_k]
+
+        return selected_indices, selected_sims
+
+    def _gather_features(self, indices):
+        """Gather features for given indices."""
+        if len(indices) == 0:
+            return None
+
         keyframe_features_list = []
-        for idx in top_k_indices:
-            global_feat = self.features[idx]  # [B, 1, C]
-            pose_feat = self.pose_features[idx]  # [B, 1, C]
-            # Concatenate along feature dimension
-            combined = torch.cat([global_feat, pose_feat], dim=-1)  # [B, 1, 2*C]
+        for idx in indices:
+            global_feat = self.features[idx]
+            pose_feat = self.pose_features[idx]
+            combined = torch.cat([global_feat, pose_feat], dim=-1)
             keyframe_features_list.append(combined)
 
-        if len(keyframe_features_list) > 0:
-            # Stack: [K, B, 1, 2*C] -> [B, K, 1, 2*C] -> [B, K, 2*C]
-            keyframe_features = torch.stack(keyframe_features_list, dim=0)  # [K, B, 1, 2*C]
-            keyframe_features = keyframe_features.permute(1, 0, 2, 3)  # [B, K, 1, 2*C]
-            keyframe_features = keyframe_features.squeeze(2)  # [B, K, 2*C]
-        else:
-            keyframe_features = None
+        keyframe_features = torch.stack(keyframe_features_list, dim=0)
+        keyframe_features = keyframe_features.permute(1, 0, 2, 3)
+        keyframe_features = keyframe_features.squeeze(2)
+        return keyframe_features
 
-        return keyframe_features, top_k_indices
-    
+    # ==================== Depth Consistency Constraint ====================
+
+    def compute_depth_consistency(self, current_depth, current_conf, current_pose,
+                                   current_pts3d, query_feat, k=3,
+                                   min_frame_gap=10, conf_threshold=1.5):
+        """
+        Compute depth consistency constraint using similar keyframes.
+
+        Projects historical 3D points to current view and computes weighted
+        consistency based on both historical and projection confidence.
+
+        Args:
+            current_depth: [B, H, W] current frame depth prediction
+            current_conf: [B, H, W] current frame confidence
+            current_pose: [B, 4, 4] current camera pose (c2w)
+            current_pts3d: [B, H, W, 3] current 3D points in camera coords
+            query_feat: [B, 1, C] current frame feature (for retrieval)
+            k: Number of similar keyframes to use
+            min_frame_gap: Minimum frame gap for retrieval
+            conf_threshold: Confidence threshold for valid points
+
+        Returns:
+            ref_depth: [B, H, W] reference depth from historical frames (or None)
+            ref_weight: [B, H, W] confidence weight for reference depth (or None)
+            consistency_info: Dict with debug information
+        """
+        B, H, W = current_depth.shape
+        device = current_depth.device
+
+        # Find similar keyframes with geometric information
+        similar_indices, similarities = self.retrieve_similar(query_feat, k, min_frame_gap)
+
+        # Filter to keyframes that have depth/pose information
+        valid_indices = []
+        for idx in similar_indices:
+            if (self.pts3d[idx] is not None and
+                self.camera_poses[idx] is not None and
+                self.confs[idx] is not None):
+                valid_indices.append(idx)
+
+        if len(valid_indices) == 0:
+            return None, None, {'num_keyframes': 0, 'valid_points': 0}
+
+        # Accumulate reference depth from multiple keyframes
+        ref_depth_sum = torch.zeros(B, H, W, device=device)
+        ref_weight_sum = torch.zeros(B, H, W, device=device)
+        total_valid_points = 0
+
+        for idx in valid_indices:
+            hist_pts3d = self.pts3d[idx]           # [B, H, W, 3] in world coords
+            hist_conf = self.confs[idx]            # [B, H, W]
+            hist_pose = self.camera_poses[idx]    # [B, 4, 4] c2w
+
+            # Project historical 3D points to current camera
+            projected_depth, projection_mask, projection_conf = self._project_points_to_view(
+                hist_pts3d, hist_conf, hist_pose, current_pose, H, W, conf_threshold
+            )
+
+            if projected_depth is None:
+                continue
+
+            # Combine historical confidence with projection validity
+            combined_weight = projection_conf * projection_mask.float()
+
+            # Accumulate
+            ref_depth_sum += projected_depth * combined_weight
+            ref_weight_sum += combined_weight
+            total_valid_points += projection_mask.sum().item()
+
+        # Normalize
+        valid_mask = ref_weight_sum > 1e-6
+        ref_depth = torch.where(valid_mask, ref_depth_sum / (ref_weight_sum + 1e-6), current_depth)
+        ref_weight = ref_weight_sum / (len(valid_indices) + 1e-6)
+
+        # Clamp weights to [0, 1]
+        ref_weight = torch.clamp(ref_weight, 0, 1)
+
+        consistency_info = {
+            'num_keyframes': len(valid_indices),
+            'valid_points': total_valid_points,
+            'keyframe_indices': valid_indices,
+        }
+
+        return ref_depth, ref_weight, consistency_info
+
+    def _project_points_to_view(self, pts3d_world, conf, src_pose, tgt_pose, H, W, conf_threshold):
+        """
+        Project 3D points from world coordinates to target camera view.
+
+        Args:
+            pts3d_world: [B, H, W, 3] 3D points in world coordinates
+            conf: [B, H, W] confidence of source points
+            src_pose: [B, 4, 4] source camera pose (c2w)
+            tgt_pose: [B, 4, 4] target camera pose (c2w)
+            H, W: Target image dimensions
+            conf_threshold: Minimum confidence for valid points
+
+        Returns:
+            projected_depth: [B, H, W] depth in target view
+            valid_mask: [B, H, W] mask of valid projections
+            projection_conf: [B, H, W] confidence of projections
+        """
+        B = pts3d_world.shape[0]
+        device = pts3d_world.device
+
+        # Transform world points to target camera coordinates
+        # tgt_pose is c2w, so we need w2c = inv(tgt_pose)
+        tgt_pose_inv = torch.inverse(tgt_pose)  # [B, 4, 4]
+
+        # Reshape points for batch matrix multiplication
+        pts_flat = pts3d_world.reshape(B, -1, 3)  # [B, H*W, 3]
+
+        # Apply transformation: pts_cam = R @ pts_world + t
+        R = tgt_pose_inv[:, :3, :3]  # [B, 3, 3]
+        t = tgt_pose_inv[:, :3, 3:4]  # [B, 3, 1]
+
+        pts_cam = torch.bmm(pts_flat, R.transpose(1, 2)) + t.transpose(1, 2)  # [B, H*W, 3]
+        pts_cam = pts_cam.reshape(B, H, W, 3)
+
+        # Get depth (z coordinate in camera space)
+        projected_depth = pts_cam[..., 2]  # [B, H, W]
+
+        # Create validity mask
+        # 1. Positive depth (in front of camera)
+        # 2. Confidence above threshold
+        # 3. Reasonable depth range
+        conf_flat = conf.reshape(B, H, W)
+        valid_mask = (projected_depth > 0.01) & (projected_depth < 100) & (conf_flat > conf_threshold)
+
+        # Confidence based on source confidence and depth consistency
+        projection_conf = torch.where(valid_mask, conf_flat / (conf_flat.max() + 1e-6), torch.zeros_like(conf_flat))
+
+        return projected_depth, valid_mask, projection_conf
+
+    def fuse_depth_with_reference(self, current_depth, current_conf, ref_depth, ref_weight,
+                                   fusion_strength=0.3):
+        """
+        Fuse current depth prediction with reference depth from keyframes.
+
+        Uses confidence-weighted fusion where historical reference has more
+        influence in low-confidence regions of current prediction.
+
+        Args:
+            current_depth: [B, H, W] current depth prediction
+            current_conf: [B, H, W] current confidence (higher = more confident)
+            ref_depth: [B, H, W] reference depth from keyframes
+            ref_weight: [B, H, W] weight/confidence of reference depth
+            fusion_strength: Base strength of reference influence (0-1)
+
+        Returns:
+            fused_depth: [B, H, W] fused depth prediction
+            fusion_weight: [B, H, W] actual weight given to reference
+        """
+        if ref_depth is None or ref_weight is None:
+            return current_depth, torch.zeros_like(current_depth)
+
+        # Normalize current confidence to [0, 1]
+        current_conf_norm = current_conf / (current_conf.max() + 1e-6)
+
+        # Adaptive fusion weight:
+        # - Low current confidence → more reference weight
+        # - High reference weight → more reference influence
+        # - Base fusion strength scales the effect
+        adaptive_weight = fusion_strength * ref_weight * (1 - current_conf_norm * 0.5)
+        adaptive_weight = torch.clamp(adaptive_weight, 0, 0.5)  # Cap at 50%
+
+        # Weighted fusion
+        fused_depth = current_depth * (1 - adaptive_weight) + ref_depth * adaptive_weight
+
+        return fused_depth, adaptive_weight
+
+    # ==================== Legacy Methods (for compatibility) ====================
+
+    def retrieve_top_k(self, query_feat, query_time, k, lambda_time):
+        """Legacy method - redirects to retrieve_diverse for backward compatibility."""
+        return self.retrieve_diverse(query_feat, k)
+
     def clear(self):
         """Clear all stored keyframes."""
         self.features = []
         self.pose_features = []
         self.timestamps = []
+        self.depths = []
+        self.confs = []
+        self.camera_poses = []
+        self.pts3d = []
         self.size = 0
 
 
@@ -1950,21 +2124,6 @@ class ARCroco3DStereo(CroCoNet):
             )
             out_pose_feat_i = dec[-1][:, 0:1]
 
-            # Add current frame to Keyframe Memory Bank if enabled
-            # Project global_feat to match memory format (proj_q projects to v_dim)
-            # Use diversity-based sampling: only add if sufficiently different from existing keyframes
-            if self.keyframe_memory_bank is not None and self.pose_head_flag:
-                proj_global_feat = self.pose_retriever.proj_q(global_img_feat_i)
-                # First frame is always added (force_add=True), others use diversity check
-                added = self.keyframe_memory_bank.add(
-                    frame_idx=i,
-                    global_feat=proj_global_feat,
-                    pose_feat=out_pose_feat_i,
-                    force_add=(i == 0)  # Always add first frame as anchor
-                )
-                if added and i % 50 == 0:
-                    print(f"[KMB] Frame {i}: Added to memory bank (size={self.keyframe_memory_bank.size})")
-
             # update mem
             new_mem = self.pose_retriever.update_mem(
                 mem, global_img_feat_i, out_pose_feat_i
@@ -1978,6 +2137,87 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth].float(),
             ]
             res = self._downstream_head(head_input, shape, pos=pos_i)
+
+            # Extract geometric info for depth consistency
+            current_pts3d = res.get("pts3d_in_self_view", None)  # [B, H, W, 3]
+            current_conf = res.get("conf_self", None)  # [B, H, W]
+            current_pose_enc = res.get("camera_pose", None)
+
+            # Convert pose encoding to 4x4 matrix for geometric operations
+            current_pose_mat = None
+            if current_pose_enc is not None:
+                from src.dust3r.utils.camera import pose_encoding_to_camera
+                current_pose_mat = pose_encoding_to_camera(current_pose_enc.clone())  # [B, 4, 4]
+
+            # Apply depth consistency constraint if keyframe bank has geometric info
+            _use_depth_consistency = getattr(self.config, 'use_depth_consistency', False)
+            if (_use_depth_consistency and
+                self.keyframe_memory_bank is not None and
+                self.keyframe_memory_bank.size > 0 and
+                current_pts3d is not None and
+                current_conf is not None and
+                current_pose_mat is not None and
+                i > 10):  # Skip first few frames
+
+                proj_query_feat = self.pose_retriever.proj_q(global_img_feat_i)
+                current_depth = current_pts3d[..., 2]  # z-coordinate as depth
+
+                # Compute depth consistency from similar keyframes
+                ref_depth, ref_weight, consistency_info = self.keyframe_memory_bank.compute_depth_consistency(
+                    current_depth=current_depth,
+                    current_conf=current_conf,
+                    current_pose=current_pose_mat,
+                    current_pts3d=current_pts3d,  # World coords after pose transform
+                    query_feat=proj_query_feat,
+                    k=3,
+                    min_frame_gap=10,
+                    conf_threshold=1.5
+                )
+
+                # Fuse depth if we got valid reference
+                if ref_depth is not None and consistency_info['num_keyframes'] > 0:
+                    fused_depth, fusion_weight = self.keyframe_memory_bank.fuse_depth_with_reference(
+                        current_depth=current_depth,
+                        current_conf=current_conf,
+                        ref_depth=ref_depth,
+                        ref_weight=ref_weight,
+                        fusion_strength=0.3
+                    )
+
+                    # Update pts3d with fused depth (only z-coordinate)
+                    fused_pts3d = current_pts3d.clone()
+                    fused_pts3d[..., 2] = fused_depth
+                    res["pts3d_in_self_view"] = fused_pts3d
+
+                    if i % 100 == 0:
+                        avg_fusion = fusion_weight.mean().item()
+                        print(f"[Depth Consistency] Frame {i}: Fused with {consistency_info['num_keyframes']} keyframes, avg_weight={avg_fusion:.3f}")
+
+            # Add current frame to Keyframe Memory Bank if enabled
+            # Now includes geometric information for depth consistency
+            if self.keyframe_memory_bank is not None and self.pose_head_flag:
+                proj_global_feat = self.pose_retriever.proj_q(global_img_feat_i)
+
+                # Prepare geometric info (transform pts3d to world coords if possible)
+                world_pts3d = None
+                if current_pts3d is not None and current_pose_mat is not None:
+                    # Transform points from camera coords to world coords
+                    from src.dust3r.utils.geometry import geotrf
+                    world_pts3d = geotrf(current_pose_mat, current_pts3d)
+
+                # Add with geometric information
+                added = self.keyframe_memory_bank.add(
+                    frame_idx=i,
+                    global_feat=proj_global_feat,
+                    pose_feat=out_pose_feat_i,
+                    depth=current_pts3d[..., 2] if current_pts3d is not None else None,
+                    conf=current_conf,
+                    camera_pose=current_pose_mat,
+                    pts3d=world_pts3d,
+                    force_add=(i == 0)
+                )
+                if added and i % 50 == 0:
+                    print(f"[KMB] Frame {i}: Added to memory bank (size={self.keyframe_memory_bank.size})")
 
             # Loop closure detection and memory recall (inference only)
             if _enable_lc and self.pose_head_flag and i > 0 and self.loop_closure_keyframe_db is not None:

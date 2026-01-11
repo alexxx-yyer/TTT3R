@@ -17,6 +17,7 @@ Example:
 """
 
 import os
+import re
 import numpy as np
 import torch
 import time
@@ -29,6 +30,20 @@ import shutil
 import gc
 import atexit
 from copy import deepcopy
+
+
+def natural_sort_key(path):
+    """
+    自然排序键函数，正确处理文件名中的数字。
+    例如: img1, img2, img10, img100 而不是 img1, img10, img100, img2
+    """
+    basename = os.path.basename(path)
+    # 将字符串分割为文本和数字部分
+    parts = re.split(r'(\d+)', basename)
+    # 将数字部分转换为整数以实现正确排序
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
+
+
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
 import matplotlib.pyplot as plt
@@ -363,6 +378,24 @@ def parse_args():
         type=int,
         default=10,
         help="Interval for adding keyframes to loop closure database",
+    )
+    # Depth consistency arguments
+    parser.add_argument(
+        "--use_depth_consistency",
+        action="store_true",
+        help="Enable depth consistency constraint from similar keyframes",
+    )
+    parser.add_argument(
+        "--depth_consistency_top_k",
+        type=int,
+        default=3,
+        help="Number of similar keyframes for depth consistency",
+    )
+    parser.add_argument(
+        "--depth_consistency_weight",
+        type=float,
+        default=0.5,
+        help="Weight for depth consistency fusion (0-1)",
     )
     return parser.parse_args()
 
@@ -779,9 +812,9 @@ def parse_seq_path(p, frame_interval=1):
     global framerate
     
     if os.path.isdir(p):
-        all_img_paths = sorted(glob.glob(f"{p}/*"))
+        all_img_paths = sorted(glob.glob(f"{p}/*"), key=natural_sort_key)
         img_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
-        img_paths = [path for path in all_img_paths 
+        img_paths = [path for path in all_img_paths
                     if os.path.splitext(path.lower())[1] in img_extensions]
         
         if not img_paths:
@@ -1051,6 +1084,14 @@ def run_inference(args):
         print(f"Loop Closure with Memory Recall enabled: threshold={args.loop_closure_threshold}, "
               f"min_frame_gap={args.loop_closure_min_frame_gap}, "
               f"keyframe_interval={args.loop_closure_keyframe_interval}")
+
+    # Configure depth consistency
+    if args.use_depth_consistency:
+        model.config.use_depth_consistency = True
+        model.config.depth_consistency_top_k = args.depth_consistency_top_k
+        model.config.depth_consistency_weight = args.depth_consistency_weight
+        print(f"Depth Consistency enabled: top_k={args.depth_consistency_top_k}, "
+              f"weight={args.depth_consistency_weight}")
 
     model.eval()
 
