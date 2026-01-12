@@ -3,6 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from collections import OrderedDict
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,6 +133,15 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         use_depth_consistency=False,
         depth_consistency_top_k=3,
         depth_consistency_weight=0.5,
+        # SLAM-aware keyframe bank config
+        use_slam_aware_keyframe_bank=False,
+        slam_baseline_threshold=0.1,
+        slam_rotation_threshold=15.0,
+        slam_coverage_threshold=0.7,
+        slam_reproj_threshold=5.0,
+        slam_alpha_feature=0.3,
+        slam_beta_overlap=0.5,
+        slam_gamma_graph=0.2,
         **croco_kwargs,
     ):
         super().__init__()
@@ -168,6 +178,15 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.use_depth_consistency = use_depth_consistency
         self.depth_consistency_top_k = depth_consistency_top_k
         self.depth_consistency_weight = depth_consistency_weight
+        # SLAM-aware keyframe bank config
+        self.use_slam_aware_keyframe_bank = use_slam_aware_keyframe_bank
+        self.slam_baseline_threshold = slam_baseline_threshold
+        self.slam_rotation_threshold = slam_rotation_threshold
+        self.slam_coverage_threshold = slam_coverage_threshold
+        self.slam_reproj_threshold = slam_reproj_threshold
+        self.slam_alpha_feature = slam_alpha_feature
+        self.slam_beta_overlap = slam_beta_overlap
+        self.slam_gamma_graph = slam_gamma_graph
         self.croco_kwargs = croco_kwargs
 
 
@@ -327,6 +346,10 @@ class KeyframeMemoryBank:
         self.confs = []              # List of [B, H, W] confidence maps
         self.camera_poses = []       # List of [B, 4, 4] camera poses (c2w)
         self.pts3d = []              # List of [B, H, W, 3] 3D points in world coords
+
+        # Scale history for retrospective correction
+        self.scale_history = []      # List of (frame_idx, scale_factor, ref_frame_idx)
+        self.cumulative_scale = 1.0  # Running cumulative scale
 
         self.size = 0
 
@@ -668,42 +691,232 @@ class KeyframeMemoryBank:
 
         return projected_depth, valid_mask, projection_conf
 
+    def align_depth_scale(self, current_depth, current_conf, ref_depth, ref_weight,
+                           min_valid_ratio=0.1, conf_threshold=1.5):
+        """
+        在线深度尺度对齐：计算并应用尺度因子来校正深度漂移。
+
+        原理：
+        - 不直接替换深度值，而是估计全局尺度因子
+        - scale = median(ref_depth / current_depth) 在重叠有效区域
+        - 校正后深度 = current_depth * scale
+
+        优点：
+        - 保留模型的相对深度结构
+        - 只校正尺度漂移，不引入局部噪声
+        - 使用中位数，对异常值鲁棒
+
+        Args:
+            current_depth: [B, H, W] 当前深度预测
+            current_conf: [B, H, W] 当前置信度
+            ref_depth: [B, H, W] 参考深度（从关键帧投影）
+            ref_weight: [B, H, W] 参考深度权重
+            min_valid_ratio: 最小有效点比例（低于此值不校正）
+            conf_threshold: 置信度阈值
+
+        Returns:
+            aligned_depth: [B, H, W] 尺度对齐后的深度
+            scale_info: dict 包含尺度因子等信息
+        """
+        if ref_depth is None or ref_weight is None:
+            return current_depth, {'scale': 1.0, 'valid_ratio': 0.0, 'applied': False}
+
+        B, H, W = current_depth.shape
+        device = current_depth.device
+
+        # 构建有效掩码：
+        # 1. 参考深度有效（权重 > 0）
+        # 2. 当前深度有效（正值）
+        # 3. 当前置信度足够高
+        valid_mask = (ref_weight > 0.1) & (current_depth > 0.01) & (current_conf > conf_threshold)
+
+        aligned_depths = []
+        scale_infos = []
+
+        for b in range(B):
+            valid_b = valid_mask[b]
+            valid_ratio = valid_b.float().mean().item()
+
+            if valid_ratio < min_valid_ratio:
+                # 有效点太少，不进行尺度校正
+                aligned_depths.append(current_depth[b])
+                scale_infos.append({'scale': 1.0, 'valid_ratio': valid_ratio, 'applied': False})
+                continue
+
+            # 提取有效区域的深度
+            curr_valid = current_depth[b][valid_b]
+            ref_valid = ref_depth[b][valid_b]
+
+            # 计算尺度比率
+            ratios = ref_valid / (curr_valid + 1e-6)
+
+            # 过滤异常比率（0.5 到 2.0 之间）
+            reasonable_mask = (ratios > 0.5) & (ratios < 2.0)
+
+            if reasonable_mask.sum() < 100:
+                # 合理比率的点太少
+                aligned_depths.append(current_depth[b])
+                scale_infos.append({'scale': 1.0, 'valid_ratio': valid_ratio, 'applied': False})
+                continue
+
+            # 使用加权中位数估计尺度
+            valid_ratios = ratios[reasonable_mask]
+            valid_weights = ref_weight[b][valid_b][reasonable_mask]
+
+            # 简单中位数（更鲁棒）
+            scale = torch.median(valid_ratios).item()
+
+            # 限制尺度变化范围（防止剧烈变化）
+            scale = max(0.8, min(1.2, scale))
+
+            # 应用尺度校正
+            aligned_depth_b = current_depth[b] * scale
+            aligned_depths.append(aligned_depth_b)
+            scale_infos.append({
+                'scale': scale,
+                'valid_ratio': valid_ratio,
+                'num_valid': reasonable_mask.sum().item(),
+                'applied': True
+            })
+
+        aligned_depth = torch.stack(aligned_depths, dim=0)
+
+        # 汇总信息
+        avg_scale = sum(s['scale'] for s in scale_infos) / len(scale_infos)
+        any_applied = any(s['applied'] for s in scale_infos)
+
+        scale_info = {
+            'scale': avg_scale,
+            'valid_ratio': sum(s['valid_ratio'] for s in scale_infos) / len(scale_infos),
+            'applied': any_applied,
+            'per_batch': scale_infos
+        }
+
+        return aligned_depth, scale_info
+
     def fuse_depth_with_reference(self, current_depth, current_conf, ref_depth, ref_weight,
                                    fusion_strength=0.3):
         """
-        Fuse current depth prediction with reference depth from keyframes.
+        [Legacy] 深度融合方法 - 建议使用 align_depth_scale 替代。
+        保留此方法以兼容旧代码。
+        """
+        # 调用新的尺度对齐方法
+        return self.align_depth_scale(current_depth, current_conf, ref_depth, ref_weight)
 
-        Uses confidence-weighted fusion where historical reference has more
-        influence in low-confidence regions of current prediction.
+    # ==================== Scale History & Retrospective Correction ====================
+
+    def record_scale(self, frame_idx, scale_factor, ref_frame_idx=None):
+        """
+        记录尺度校正历史，用于后续回溯优化。
 
         Args:
-            current_depth: [B, H, W] current depth prediction
-            current_conf: [B, H, W] current confidence (higher = more confident)
-            ref_depth: [B, H, W] reference depth from keyframes
-            ref_weight: [B, H, W] weight/confidence of reference depth
-            fusion_strength: Base strength of reference influence (0-1)
+            frame_idx: 当前帧索引
+            scale_factor: 应用的尺度因子
+            ref_frame_idx: 参考帧索引（可选）
+        """
+        self.scale_history.append({
+            'frame_idx': frame_idx,
+            'scale': scale_factor,
+            'ref_frame_idx': ref_frame_idx,
+            'cumulative': self.cumulative_scale * scale_factor
+        })
+        self.cumulative_scale *= scale_factor
+
+    def get_retrospective_scales(self):
+        """
+        计算回溯尺度校正因子。
+
+        原理：
+        - 如果累积尺度偏离1.0，说明存在尺度漂移
+        - 将漂移分摊到所有历史帧上
+        - 早期帧校正更多，后期帧校正更少
 
         Returns:
-            fused_depth: [B, H, W] fused depth prediction
-            fusion_weight: [B, H, W] actual weight given to reference
+            dict: {frame_idx: correction_scale} 每帧的校正因子
         """
-        if ref_depth is None or ref_weight is None:
-            return current_depth, torch.zeros_like(current_depth)
+        if len(self.scale_history) == 0:
+            return {}
 
-        # Normalize current confidence to [0, 1]
-        current_conf_norm = current_conf / (current_conf.max() + 1e-6)
+        # 计算总漂移
+        total_drift = self.cumulative_scale
+        if abs(total_drift - 1.0) < 0.01:
+            # 几乎没有漂移，无需校正
+            return {}
 
-        # Adaptive fusion weight:
-        # - Low current confidence → more reference weight
-        # - High reference weight → more reference influence
-        # - Base fusion strength scales the effect
-        adaptive_weight = fusion_strength * ref_weight * (1 - current_conf_norm * 0.5)
-        adaptive_weight = torch.clamp(adaptive_weight, 0, 0.5)  # Cap at 50%
+        # 线性分摊漂移到各帧
+        # correction[i] = (total_drift)^(-i/n), 使得最终帧的校正接近 1/total_drift
+        n = len(self.scale_history)
+        corrections = {}
 
-        # Weighted fusion
-        fused_depth = current_depth * (1 - adaptive_weight) + ref_depth * adaptive_weight
+        for i, entry in enumerate(self.scale_history):
+            # 早期帧需要更大校正，后期帧较小
+            # 使用指数衰减分摊
+            progress = i / n  # 0 -> 1
+            correction = total_drift ** (-progress)
+            corrections[entry['frame_idx']] = correction
 
-        return fused_depth, adaptive_weight
+        return corrections
+
+    def apply_retrospective_correction(self, outputs, correction_scales=None):
+        """
+        将回溯尺度校正应用到历史输出。
+
+        Args:
+            outputs: 推理输出 {'pred': [...], 'views': [...]}
+            correction_scales: 校正因子字典，如果为None则自动计算
+
+        Returns:
+            outputs: 校正后的输出
+        """
+        if correction_scales is None:
+            correction_scales = self.get_retrospective_scales()
+
+        if not correction_scales:
+            return outputs
+
+        print(f"[Retrospective] 应用回溯尺度校正到 {len(correction_scales)} 帧...")
+
+        corrected_count = 0
+        for frame_idx, scale in correction_scales.items():
+            if frame_idx >= len(outputs['pred']):
+                continue
+
+            pred = outputs['pred'][frame_idx]
+
+            # 校正 pts3d
+            if 'pts3d' in pred and pred['pts3d'] is not None:
+                if isinstance(pred['pts3d'], torch.Tensor):
+                    pred['pts3d'] = pred['pts3d'] * scale
+                elif isinstance(pred['pts3d'], np.ndarray):
+                    pred['pts3d'] = pred['pts3d'] * scale
+
+            # 校正 pts3d_in_self_view
+            if 'pts3d_in_self_view' in pred and pred['pts3d_in_self_view'] is not None:
+                if isinstance(pred['pts3d_in_self_view'], torch.Tensor):
+                    pred['pts3d_in_self_view'] = pred['pts3d_in_self_view'] * scale
+                elif isinstance(pred['pts3d_in_self_view'], np.ndarray):
+                    pred['pts3d_in_self_view'] = pred['pts3d_in_self_view'] * scale
+
+            corrected_count += 1
+
+        avg_correction = sum(correction_scales.values()) / len(correction_scales)
+        print(f"[Retrospective] 校正完成: {corrected_count} 帧, 平均校正因子={avg_correction:.4f}")
+
+        return outputs
+
+    def detect_scale_drift(self, threshold=0.1):
+        """
+        检测是否存在显著的尺度漂移。
+
+        Args:
+            threshold: 漂移阈值（相对于1.0的偏差）
+
+        Returns:
+            bool: 是否存在显著漂移
+            float: 累积漂移量
+        """
+        drift = abs(self.cumulative_scale - 1.0)
+        return drift > threshold, self.cumulative_scale
 
     # ==================== Legacy Methods (for compatibility) ====================
 
@@ -712,7 +925,7 @@ class KeyframeMemoryBank:
         return self.retrieve_diverse(query_feat, k)
 
     def clear(self):
-        """Clear all stored keyframes."""
+        """Clear all stored keyframes and scale history."""
         self.features = []
         self.pose_features = []
         self.timestamps = []
@@ -720,7 +933,591 @@ class KeyframeMemoryBank:
         self.confs = []
         self.camera_poses = []
         self.pts3d = []
+        self.scale_history = []
+        self.cumulative_scale = 1.0
         self.size = 0
+
+
+class SLAMAwareKeyframeBank:
+    """
+    SLAM-aware Keyframe Memory Bank
+
+    融合几何约束和语义特征的关键帧管理系统：
+    1. Keyframe Decision - 基于多信号判断（视差、覆盖率、重投影误差、置信度）
+    2. Pose Graph - 维护关键帧之间的相对位姿边
+    3. SLAM-aware Retrieval - 几何+语义双条件检索
+    4. Lightweight PGO - 轻量级位姿图优化
+    """
+
+    def __init__(self, max_size=100, device='cuda',
+                 # Keyframe decision thresholds
+                 baseline_threshold=0.1,      # 最小平移基线
+                 rotation_threshold=15.0,     # 最小旋转角度（度）
+                 coverage_threshold=0.7,      # 最小覆盖率才跳过
+                 reproj_threshold=5.0,        # 重投影误差阈值
+                 conf_threshold=1.5,          # 置信度阈值
+                 # Retrieval weights
+                 alpha_feature=0.3,           # 特征相似度权重
+                 beta_overlap=0.5,            # 几何重叠权重
+                 gamma_graph=0.2):            # 图距离权重
+        """
+        初始化 SLAM-aware Keyframe Bank
+        """
+        self.max_size = max_size
+        self.device = device
+
+        # Keyframe decision thresholds
+        self.baseline_threshold = baseline_threshold
+        self.rotation_threshold = rotation_threshold
+        self.coverage_threshold = coverage_threshold
+        self.reproj_threshold = reproj_threshold
+        self.conf_threshold = conf_threshold
+
+        # Retrieval weights
+        self.alpha = alpha_feature
+        self.beta = beta_overlap
+        self.gamma = gamma_graph
+
+        # ========== Keyframe Storage ==========
+        self.keyframes = []  # List of keyframe dicts
+        # Each keyframe: {
+        #   'frame_idx': int,
+        #   'feature': [B, 1, C],          # 全局特征（原始encoder特征，不投影）
+        #   'pose': [B, 4, 4],             # camera pose (c2w)
+        #   'depth': [B, H, W],            # depth map
+        #   'conf': [B, H, W],             # confidence map
+        #   'pts3d': [B, H, W, 3],         # 3D points in world coords
+        # }
+
+        # ========== Pose Graph ==========
+        self.edges = []  # List of edge dicts
+        # Each edge: {
+        #   'from_idx': int,               # keyframe index (in self.keyframes)
+        #   'to_idx': int,
+        #   'relative_pose': [4, 4],       # T_from_to
+        #   'weight': float,               # edge weight (from confidence, overlap, inliers)
+        #   'type': str,                   # 'sequential', 'loop', 'retrieval'
+        # }
+
+        # ========== Graph Adjacency ==========
+        self.adjacency = {}  # {kf_idx: [(neighbor_idx, weight), ...]}
+
+        self.size = 0
+
+    # ==================== Step 1: Keyframe Decision ====================
+
+    def should_add_keyframe(self, frame_idx, current_pose, current_depth, current_conf,
+                            current_pts3d=None, current_feature=None):
+        """
+        基于多信号判断是否应该新建关键帧
+
+        信号：
+        1. 视差/运动: ||Δt||, ||ΔR||
+        2. 覆盖率: 当前帧能否被已有 keyframe explain
+        3. 重投影误差: reproj error 是否上升
+        4. 置信度: 模型对当前帧 depth/pose 是否可靠
+
+        Returns:
+            should_add: bool
+            reason: str (debug info)
+        """
+        if self.size == 0:
+            return True, "first_keyframe"
+
+        # 获取最近的关键帧
+        last_kf = self.keyframes[-1]
+        last_pose = last_kf['pose']
+
+        # ========== Signal 1: Motion (baseline & rotation) ==========
+        motion_check, motion_info = self._check_motion(current_pose, last_pose)
+
+        # ========== Signal 2: Coverage ==========
+        coverage_check, coverage_ratio = self._check_coverage(
+            current_pose, current_depth, current_pts3d
+        )
+
+        # ========== Signal 3: Reprojection Error ==========
+        reproj_check, reproj_error = self._check_reprojection_error(
+            current_pose, current_depth, last_kf
+        )
+
+        # ========== Signal 4: Confidence ==========
+        conf_check, avg_conf = self._check_confidence(current_conf)
+
+        # ========== Decision Logic ==========
+        # 满足任一条件就插入 keyframe
+        should_add = motion_check or (not coverage_check) or reproj_check
+
+        # 如果置信度太低，也应该插入（标记为低质量）
+        if not conf_check and not should_add:
+            should_add = True
+            reason = f"low_confidence (avg={avg_conf:.2f})"
+        elif motion_check:
+            reason = f"motion ({motion_info})"
+        elif not coverage_check:
+            reason = f"low_coverage ({coverage_ratio:.2f})"
+        elif reproj_check:
+            reason = f"high_reproj_error ({reproj_error:.2f})"
+        else:
+            reason = "none"
+
+        return should_add, reason
+
+    def _check_motion(self, current_pose, last_pose):
+        """检查相对运动是否足够大"""
+        # 计算相对位姿
+        relative_pose = torch.inverse(last_pose) @ current_pose  # [B, 4, 4]
+
+        # 提取平移和旋转
+        translation = relative_pose[0, :3, 3]  # [3]
+        rotation_mat = relative_pose[0, :3, :3]  # [3, 3]
+
+        # 平移基线
+        baseline = torch.norm(translation).item()
+
+        # 旋转角度 (通过 trace 计算)
+        trace = torch.trace(rotation_mat)
+        cos_angle = (trace - 1) / 2
+        cos_angle = torch.clamp(cos_angle, -1, 1)
+        rotation_angle = torch.acos(cos_angle).item() * 180 / 3.14159  # degrees
+
+        motion_sufficient = (baseline > self.baseline_threshold or
+                            rotation_angle > self.rotation_threshold)
+
+        info = f"baseline={baseline:.3f}, rotation={rotation_angle:.1f}°"
+        return motion_sufficient, info
+
+    def _check_coverage(self, current_pose, current_depth, current_pts3d):
+        """检查当前帧是否被已有关键帧覆盖"""
+        if current_pts3d is None or self.size == 0:
+            return False, 0.0  # 无法检查，假设未覆盖
+
+        # 计算与所有关键帧的重叠
+        max_overlap = 0.0
+        for kf in self.keyframes:
+            if kf['pts3d'] is None:
+                continue
+            overlap = self._compute_view_overlap(current_pose, kf['pose'], kf['pts3d'])
+            max_overlap = max(max_overlap, overlap)
+
+        covered = max_overlap > self.coverage_threshold
+        return covered, max_overlap
+
+    def _check_reprojection_error(self, current_pose, current_depth, last_kf):
+        """检查重投影误差是否过高"""
+        if last_kf['pts3d'] is None or current_depth is None:
+            return False, 0.0
+
+        # 将上一关键帧的3D点投影到当前视角
+        pts3d_world = last_kf['pts3d']  # [B, H, W, 3]
+
+        # 投影到当前相机
+        pose_inv = torch.inverse(current_pose)
+        B, H, W, _ = pts3d_world.shape
+        pts_flat = pts3d_world.reshape(B, -1, 3)
+
+        R = pose_inv[:, :3, :3]
+        t = pose_inv[:, :3, 3:4]
+        pts_cam = torch.bmm(pts_flat, R.transpose(1, 2)) + t.transpose(1, 2)
+        pts_cam = pts_cam.reshape(B, H, W, 3)
+
+        # 深度差异作为重投影误差的代理
+        projected_depth = pts_cam[..., 2]
+
+        # 计算有效区域的误差
+        valid_mask = (projected_depth > 0.1) & (current_depth > 0.1)
+        if valid_mask.sum() < 100:
+            return False, 0.0
+
+        depth_ratio = projected_depth[valid_mask] / (current_depth[valid_mask] + 1e-6)
+        reproj_error = torch.abs(depth_ratio - 1.0).median().item() * 100  # percentage
+
+        high_error = reproj_error > self.reproj_threshold
+        return high_error, reproj_error
+
+    def _check_confidence(self, current_conf):
+        """检查置信度是否足够"""
+        if current_conf is None:
+            return True, 0.0
+
+        avg_conf = current_conf.mean().item()
+        sufficient = avg_conf > self.conf_threshold
+        return sufficient, avg_conf
+
+    # ==================== Step 2: Add Keyframe & Edges ====================
+
+    def add_keyframe(self, frame_idx, feature, pose, depth=None, conf=None, pts3d=None):
+        """
+        添加关键帧并建立与现有关键帧的边
+        """
+        kf = {
+            'frame_idx': frame_idx,
+            'feature': feature.detach().clone().to(self.device) if feature is not None else None,
+            'pose': pose.detach().clone().to(self.device) if pose is not None else None,
+            'depth': depth.detach().clone().to(self.device) if depth is not None else None,
+            'conf': conf.detach().clone().to(self.device) if conf is not None else None,
+            'pts3d': pts3d.detach().clone().to(self.device) if pts3d is not None else None,
+        }
+
+        new_idx = self.size
+        self.keyframes.append(kf)
+        self.adjacency[new_idx] = []
+
+        # ========== 添加边 ==========
+
+        # 1. Sequential edge (与前一关键帧)
+        if self.size > 0:
+            self._add_edge(self.size - 1, new_idx, edge_type='sequential')
+
+        # 2. Retrieval edges (与相似/重叠的关键帧)
+        if self.size > 1 and feature is not None:
+            similar_kfs = self._find_similar_keyframes(feature, pose, top_k=3)
+            for kf_idx, score in similar_kfs:
+                if kf_idx != self.size - 1:  # 避免重复
+                    self._add_edge(kf_idx, new_idx, edge_type='retrieval')
+
+        self.size += 1
+
+        # 淘汰旧关键帧（如果超出限制）
+        if self.max_size is not None and self.size > self.max_size:
+            self._evict_keyframe()
+
+        return new_idx
+
+    def _add_edge(self, from_idx, to_idx, edge_type='sequential'):
+        """添加位姿图边"""
+        if from_idx >= len(self.keyframes) or to_idx >= len(self.keyframes):
+            return
+
+        from_pose = self.keyframes[from_idx]['pose']
+        to_pose = self.keyframes[to_idx]['pose']
+
+        if from_pose is None or to_pose is None:
+            return
+
+        # 计算相对位姿 T_from_to
+        relative_pose = torch.inverse(from_pose) @ to_pose  # [B, 4, 4]
+
+        # 计算边权重
+        weight = self._compute_edge_weight(from_idx, to_idx, edge_type)
+
+        edge = {
+            'from_idx': from_idx,
+            'to_idx': to_idx,
+            'relative_pose': relative_pose[0].detach().clone(),  # [4, 4]
+            'weight': weight,
+            'type': edge_type,
+        }
+
+        self.edges.append(edge)
+
+        # 更新邻接表
+        self.adjacency[from_idx].append((to_idx, weight))
+        if to_idx not in self.adjacency:
+            self.adjacency[to_idx] = []
+        self.adjacency[to_idx].append((from_idx, weight))
+
+    def _compute_edge_weight(self, from_idx, to_idx, edge_type):
+        """计算边权重（基于置信度、重叠率）"""
+        weight = 1.0
+
+        # 基于置信度
+        from_conf = self.keyframes[from_idx].get('conf')
+        to_conf = self.keyframes[to_idx].get('conf')
+        if from_conf is not None and to_conf is not None:
+            avg_conf = (from_conf.mean().item() + to_conf.mean().item()) / 2
+            weight *= min(avg_conf / self.conf_threshold, 1.0)
+
+        # 基于重叠率
+        from_pose = self.keyframes[from_idx]['pose']
+        to_pose = self.keyframes[to_idx]['pose']
+        to_pts3d = self.keyframes[to_idx].get('pts3d')
+        if to_pts3d is not None and from_pose is not None:
+            overlap = self._compute_view_overlap(from_pose, to_pose, to_pts3d)
+            weight *= (0.5 + 0.5 * overlap)  # 重叠率越高权重越大
+
+        # 边类型加成
+        if edge_type == 'loop':
+            weight *= 1.5  # 回环边更重要
+
+        return weight
+
+    def add_loop_edge(self, from_frame_idx, to_frame_idx):
+        """添加回环边"""
+        # 找到对应的关键帧索引
+        from_kf_idx = None
+        to_kf_idx = None
+        for i, kf in enumerate(self.keyframes):
+            if kf['frame_idx'] == from_frame_idx:
+                from_kf_idx = i
+            if kf['frame_idx'] == to_frame_idx:
+                to_kf_idx = i
+
+        if from_kf_idx is not None and to_kf_idx is not None:
+            self._add_edge(from_kf_idx, to_kf_idx, edge_type='loop')
+            return True
+        return False
+
+    # ==================== Step 3: SLAM-aware Retrieval ====================
+
+    def retrieve_slam_aware(self, query_feature, query_pose, query_depth=None, top_k=5):
+        """
+        SLAM-aware 检索：融合特征相似度、几何重叠、图距离
+
+        score(k) = α·sim(F_t, F_k) + β·overlap(t, k) - γ·dist_graph(t, k)
+
+        Args:
+            query_feature: [B, 1, C] 当前帧特征
+            query_pose: [B, 4, 4] 当前帧位姿
+            query_depth: [B, H, W] 当前帧深度（可选）
+            top_k: 返回 top-k 关键帧
+
+        Returns:
+            selected_indices: List[int] 选中的关键帧索引
+            scores: List[float] 对应分数
+        """
+        if self.size == 0:
+            return [], []
+
+        scores = []
+
+        for i, kf in enumerate(self.keyframes):
+            # ========== Feature Similarity ==========
+            if query_feature is not None and kf['feature'] is not None:
+                sim = self._compute_cosine_similarity(query_feature, kf['feature'])
+            else:
+                sim = 0.5  # 默认中等相似度
+
+            # ========== Geometric Overlap ==========
+            if query_pose is not None and kf['pose'] is not None and kf['pts3d'] is not None:
+                overlap = self._compute_view_overlap(query_pose, kf['pose'], kf['pts3d'])
+            else:
+                overlap = 0.0
+
+            # ========== Graph Distance ==========
+            # 使用最近关键帧的图距离作为参考
+            if self.size > 0:
+                # 简化：用帧索引差距作为图距离的代理
+                frame_gap = abs(kf['frame_idx'] - self.keyframes[-1]['frame_idx'])
+                # 归一化到 [0, 1]，gap 越大距离越大
+                graph_dist = min(frame_gap / 100.0, 1.0)
+            else:
+                graph_dist = 0.0
+
+            # ========== Combined Score ==========
+            score = (self.alpha * sim +
+                    self.beta * overlap -
+                    self.gamma * graph_dist)
+
+            scores.append((i, score, {'sim': sim, 'overlap': overlap, 'graph_dist': graph_dist}))
+
+        # 按分数排序
+        scores.sort(key=lambda x: x[1], reverse=True)
+
+        # 返回 top-k
+        selected_indices = [s[0] for s in scores[:top_k]]
+        selected_scores = [s[1] for s in scores[:top_k]]
+
+        return selected_indices, selected_scores
+
+    def _compute_cosine_similarity(self, feat_a, feat_b):
+        """计算余弦相似度"""
+        a_norm = F.normalize(feat_a, p=2, dim=-1)
+        b_norm = F.normalize(feat_b, p=2, dim=-1)
+        sim = (a_norm * b_norm).sum(dim=-1).mean().item()
+        return sim
+
+    def _compute_view_overlap(self, pose_a, pose_b, pts3d_b):
+        """
+        计算两个视角的几何重叠度
+        将 pts3d_b (世界坐标) 投影到 pose_a 的视角
+        """
+        if pts3d_b is None:
+            return 0.0
+
+        # 确保所有张量在同一设备上
+        device = pose_a.device
+        pose_b = pose_b.to(device)
+        pts3d_b = pts3d_b.to(device)
+
+        B, H, W, _ = pts3d_b.shape
+
+        # 世界坐标 → 相机A坐标
+        pose_a_inv = torch.inverse(pose_a)  # [B, 4, 4]
+        pts_flat = pts3d_b.reshape(B, -1, 3)  # [B, H*W, 3]
+
+        R = pose_a_inv[:, :3, :3]
+        t = pose_a_inv[:, :3, 3:4]
+        pts_in_a = torch.bmm(pts_flat, R.transpose(1, 2)) + t.transpose(1, 2)
+
+        # 检查哪些点在相机A前方且在视野内
+        z = pts_in_a[..., 2]
+        valid_depth = (z > 0.1) & (z < 50)
+
+        # 简单的视野检查（假设 FOV 约 60°）
+        x, y = pts_in_a[..., 0], pts_in_a[..., 1]
+        in_fov = (torch.abs(x / (z + 1e-6)) < 0.8) & (torch.abs(y / (z + 1e-6)) < 0.6)
+
+        valid = valid_depth & in_fov
+        overlap_ratio = valid.float().mean().item()
+
+        return overlap_ratio
+
+    def _find_similar_keyframes(self, query_feature, query_pose, top_k=3):
+        """快速找到相似关键帧（用于建边）"""
+        scores = []
+        for i, kf in enumerate(self.keyframes[:-1]):  # 排除刚加的
+            if kf['feature'] is not None:
+                sim = self._compute_cosine_similarity(query_feature, kf['feature'])
+                scores.append((i, sim))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+    # ==================== Step 4: Lightweight Pose Graph Optimization ====================
+
+    def optimize_poses(self, num_iterations=10, lr=0.01):
+        """
+        轻量级位姿图优化
+
+        最小化相对位姿误差：
+        E = Σ w_ij * || log(T_ij^{-1} * T_i^{-1} * T_j) ||^2
+
+        Args:
+            num_iterations: 优化迭代次数
+            lr: 学习率
+
+        Returns:
+            optimized: bool 是否成功优化
+        """
+        if len(self.edges) == 0:
+            return False
+
+        # 收集需要优化的位姿
+        poses = []
+        for kf in self.keyframes:
+            if kf['pose'] is not None:
+                poses.append(kf['pose'].clone().requires_grad_(True))
+            else:
+                poses.append(None)
+
+        # 简单的梯度下降优化
+        for iteration in range(num_iterations):
+            total_error = 0.0
+
+            for edge in self.edges:
+                from_idx = edge['from_idx']
+                to_idx = edge['to_idx']
+                T_rel = edge['relative_pose']
+                weight = edge['weight']
+
+                if poses[from_idx] is None or poses[to_idx] is None:
+                    continue
+
+                # 计算当前相对位姿
+                T_from = poses[from_idx][0]  # [4, 4]
+                T_to = poses[to_idx][0]      # [4, 4]
+                T_rel_current = torch.inverse(T_from) @ T_to
+
+                # 位姿误差（简化：用 Frobenius 范数）
+                error = torch.norm(T_rel_current - T_rel) * weight
+                total_error += error.item()
+
+                # 梯度更新（简化版本）
+                if poses[to_idx].grad is not None:
+                    poses[to_idx].grad.zero_()
+                error.backward(retain_graph=True)
+
+                if poses[to_idx].grad is not None:
+                    with torch.no_grad():
+                        poses[to_idx] -= lr * poses[to_idx].grad
+
+            if iteration % 5 == 0:
+                print(f"[PGO] Iteration {iteration}: error = {total_error:.6f}")
+
+        # 更新关键帧位姿
+        for i, kf in enumerate(self.keyframes):
+            if poses[i] is not None:
+                kf['pose'] = poses[i].detach()
+
+        return True
+
+    # ==================== Utility Methods ====================
+
+    def get_keyframe_features(self, indices):
+        """获取指定关键帧的特征"""
+        features = []
+        for idx in indices:
+            if idx < len(self.keyframes) and self.keyframes[idx]['feature'] is not None:
+                features.append(self.keyframes[idx]['feature'])
+
+        if len(features) == 0:
+            return None
+        return torch.cat(features, dim=1)  # [B, K, C]
+
+    def get_keyframe_poses(self, indices):
+        """获取指定关键帧的位姿"""
+        poses = []
+        for idx in indices:
+            if idx < len(self.keyframes) and self.keyframes[idx]['pose'] is not None:
+                poses.append(self.keyframes[idx]['pose'])
+
+        if len(poses) == 0:
+            return None
+        return torch.stack(poses, dim=1)  # [B, K, 4, 4]
+
+    def _evict_keyframe(self):
+        """淘汰冗余关键帧（保留头尾，删除中间最冗余的）"""
+        if self.size <= 2:
+            return
+
+        # 找到中间部分最冗余的关键帧（边最多或重叠最高）
+        min_importance = float('inf')
+        evict_idx = 1  # 默认删第二个
+
+        for i in range(1, self.size - 1):  # 不删头尾
+            # 简单策略：边越少越不重要
+            importance = len(self.adjacency.get(i, []))
+            if importance < min_importance:
+                min_importance = importance
+                evict_idx = i
+
+        # 删除关键帧
+        self.keyframes.pop(evict_idx)
+        self.size -= 1
+
+        # 重建邻接表和边（简化处理）
+        self._rebuild_adjacency()
+
+    def _rebuild_adjacency(self):
+        """重建邻接表"""
+        self.adjacency = {i: [] for i in range(self.size)}
+        valid_edges = []
+        for edge in self.edges:
+            if edge['from_idx'] < self.size and edge['to_idx'] < self.size:
+                valid_edges.append(edge)
+                self.adjacency[edge['from_idx']].append((edge['to_idx'], edge['weight']))
+                self.adjacency[edge['to_idx']].append((edge['from_idx'], edge['weight']))
+        self.edges = valid_edges
+
+    def clear(self):
+        """清空所有数据"""
+        self.keyframes = []
+        self.edges = []
+        self.adjacency = {}
+        self.size = 0
+
+    def get_stats(self):
+        """获取统计信息"""
+        return {
+            'num_keyframes': self.size,
+            'num_edges': len(self.edges),
+            'edge_types': {
+                'sequential': sum(1 for e in self.edges if e['type'] == 'sequential'),
+                'retrieval': sum(1 for e in self.edges if e['type'] == 'retrieval'),
+                'loop': sum(1 for e in self.edges if e['type'] == 'loop'),
+            }
+        }
 
 
 class LoopClosureKeyframeDB(nn.Module):
@@ -1113,6 +1910,23 @@ class ARCroco3DStereo(CroCoNet):
             )
         else:
             self.keyframe_memory_bank = None
+
+        # Initialize SLAM-aware Keyframe Bank if enabled
+        if config.use_slam_aware_keyframe_bank:
+            self.slam_keyframe_bank = SLAMAwareKeyframeBank(
+                max_size=config.keyframe_memory_max_size or 100,
+                device='cuda',
+                baseline_threshold=config.slam_baseline_threshold,
+                rotation_threshold=config.slam_rotation_threshold,
+                coverage_threshold=config.slam_coverage_threshold,
+                reproj_threshold=config.slam_reproj_threshold,
+                conf_threshold=1.5,
+                alpha_feature=config.slam_alpha_feature,
+                beta_overlap=config.slam_beta_overlap,
+                gamma_graph=config.slam_gamma_graph,
+            )
+        else:
+            self.slam_keyframe_bank = None
 
         # Initialize Loop Closure components if enabled
         if config.enable_loop_closure and self.pose_head_flag:
@@ -2058,6 +2872,9 @@ class ARCroco3DStereo(CroCoNet):
                 # Initialize Keyframe Memory Bank device (but don't clear - preserve long-term memory)
                 if self.keyframe_memory_bank is not None:
                     self.keyframe_memory_bank.device = device
+                # Initialize SLAM-aware Keyframe Bank device
+                if self.slam_keyframe_bank is not None:
+                    self.slam_keyframe_bank.device = device
                 # Reset loop closure keyframe DB for new sequence
                 if _enable_lc and self.loop_closure_keyframe_db is not None:
                     self.loop_closure_keyframe_db.reset(feat_i.shape[0], device=feat_i.device)
@@ -2071,7 +2888,45 @@ class ARCroco3DStereo(CroCoNet):
 
                 # Retrieve keyframes from long-term memory if available
                 keyframe_features = None
-                if self.keyframe_memory_bank is not None and self.keyframe_memory_bank.size > 0:
+                slam_keyframe_indices = None
+
+                # Option 1: Use SLAM-aware Keyframe Bank (preferred)
+                if self.slam_keyframe_bank is not None and self.slam_keyframe_bank.size > 0:
+                    # Get current pose for SLAM-aware retrieval
+                    _current_pose_for_retrieval = None
+                    if i > 0 and len(ress) > 0:
+                        _prev_pose = ress[-1].get("camera_pose", None)
+                        if _prev_pose is not None:
+                            from src.dust3r.utils.camera import pose_encoding_to_camera
+                            _current_pose_for_retrieval = pose_encoding_to_camera(_prev_pose.clone())
+
+                    slam_keyframe_indices, slam_scores = self.slam_keyframe_bank.retrieve_slam_aware(
+                        query_feature=global_img_feat_i,  # 使用原始特征，不投影
+                        query_pose=_current_pose_for_retrieval,
+                        top_k=self.config.keyframe_memory_top_k
+                    )
+
+                    if len(slam_keyframe_indices) > 0:
+                        keyframe_features_raw = self.slam_keyframe_bank.get_keyframe_features(slam_keyframe_indices)
+                        if keyframe_features_raw is not None:
+                            # Convert from [B, K, enc_embed_dim] to [B, K, 2*v_dim] format
+                            # Project global_feat to v_dim, then concatenate with zero pose_feat
+                            B, K, C = keyframe_features_raw.shape
+                            v_dim = self.pose_retriever.v_dim
+                            # Project global_feat from enc_embed_dim to v_dim
+                            proj_global_feat = self.pose_retriever.proj_q(keyframe_features_raw)  # [B, K, v_dim]
+                            # Create zero pose_feat (since SLAMAwareKeyframeBank doesn't store pose_feat)
+                            zero_pose_feat = torch.zeros(B, K, v_dim, device=proj_global_feat.device, dtype=proj_global_feat.dtype)
+                            # Concatenate to match mem format [B, K, 2*v_dim]
+                            keyframe_features = torch.cat([proj_global_feat, zero_pose_feat], dim=-1)  # [B, K, 2*v_dim]
+                        else:
+                            keyframe_features = None
+                        if keyframe_features is not None and i % 50 == 0:
+                            print(f"[SLAM-KMB] Frame {i}: retrieved {len(slam_keyframe_indices)} keyframes "
+                                  f"(scores: {[f'{s:.3f}' for s in slam_scores[:3]]})")
+
+                # Option 2: Fallback to original KeyframeMemoryBank
+                elif self.keyframe_memory_bank is not None and self.keyframe_memory_bank.size > 0:
                     proj_query_feat = self.pose_retriever.proj_q(global_img_feat_i)
                     keyframe_features, _ = self.keyframe_memory_bank.retrieve_top_k(
                         query_feat=proj_query_feat,
@@ -2149,7 +3004,7 @@ class ARCroco3DStereo(CroCoNet):
                 from src.dust3r.utils.camera import pose_encoding_to_camera
                 current_pose_mat = pose_encoding_to_camera(current_pose_enc.clone())  # [B, 4, 4]
 
-            # Apply depth consistency constraint if keyframe bank has geometric info
+            # Apply depth scale alignment if keyframe bank has geometric info
             _use_depth_consistency = getattr(self.config, 'use_depth_consistency', False)
             if (_use_depth_consistency and
                 self.keyframe_memory_bank is not None and
@@ -2167,43 +3022,79 @@ class ARCroco3DStereo(CroCoNet):
                     current_depth=current_depth,
                     current_conf=current_conf,
                     current_pose=current_pose_mat,
-                    current_pts3d=current_pts3d,  # World coords after pose transform
+                    current_pts3d=current_pts3d,
                     query_feat=proj_query_feat,
-                    k=3,
+                    k=getattr(self.config, 'depth_consistency_top_k', 3),
                     min_frame_gap=10,
                     conf_threshold=1.5
                 )
 
-                # Fuse depth if we got valid reference
+                # Apply scale alignment if we got valid reference
                 if ref_depth is not None and consistency_info['num_keyframes'] > 0:
-                    fused_depth, fusion_weight = self.keyframe_memory_bank.fuse_depth_with_reference(
+                    aligned_depth, scale_info = self.keyframe_memory_bank.align_depth_scale(
                         current_depth=current_depth,
                         current_conf=current_conf,
                         ref_depth=ref_depth,
                         ref_weight=ref_weight,
-                        fusion_strength=0.3
+                        min_valid_ratio=0.1,
+                        conf_threshold=1.5
                     )
 
-                    # Update pts3d with fused depth (only z-coordinate)
-                    fused_pts3d = current_pts3d.clone()
-                    fused_pts3d[..., 2] = fused_depth
-                    res["pts3d_in_self_view"] = fused_pts3d
+                    # 如果尺度校正被应用，更新整个 pts3d（保持相对结构）
+                    if scale_info['applied']:
+                        scale = scale_info['scale']
+                        # 对整个 pts3d 应用尺度（x, y, z 同时缩放以保持几何一致性）
+                        scaled_pts3d = current_pts3d * scale
+                        res["pts3d_in_self_view"] = scaled_pts3d
 
-                    if i % 100 == 0:
-                        avg_fusion = fusion_weight.mean().item()
-                        print(f"[Depth Consistency] Frame {i}: Fused with {consistency_info['num_keyframes']} keyframes, avg_weight={avg_fusion:.3f}")
+                        # 记录尺度历史，用于回溯优化
+                        ref_idx = consistency_info['keyframe_indices'][0] if consistency_info['keyframe_indices'] else None
+                        self.keyframe_memory_bank.record_scale(i, scale, ref_idx)
 
-            # Add current frame to Keyframe Memory Bank if enabled
-            # Now includes geometric information for depth consistency
-            if self.keyframe_memory_bank is not None and self.pose_head_flag:
+                        if i % 100 == 0:
+                            drift_detected, cumulative = self.keyframe_memory_bank.detect_scale_drift()
+                            print(f"[Depth Scale] Frame {i}: scale={scale:.4f}, "
+                                  f"cumulative={cumulative:.4f}, "
+                                  f"keyframes={consistency_info['num_keyframes']}")
+
+            # Prepare geometric info (transform pts3d to world coords if possible)
+            world_pts3d = None
+            if current_pts3d is not None and current_pose_mat is not None:
+                # Transform points from camera coords to world coords
+                from src.dust3r.utils.geometry import geotrf
+                world_pts3d = geotrf(current_pose_mat, current_pts3d)
+
+            # Add current frame to SLAM-aware Keyframe Bank if enabled (preferred)
+            if self.slam_keyframe_bank is not None and self.pose_head_flag:
+                current_depth = current_pts3d[..., 2] if current_pts3d is not None else None
+
+                # Use multi-signal decision for keyframe selection
+                should_add, reason = self.slam_keyframe_bank.should_add_keyframe(
+                    frame_idx=i,
+                    current_pose=current_pose_mat,
+                    current_depth=current_depth,
+                    current_conf=current_conf,
+                    current_pts3d=world_pts3d,
+                    current_feature=global_img_feat_i
+                )
+
+                if should_add:
+                    self.slam_keyframe_bank.add_keyframe(
+                        frame_idx=i,
+                        feature=global_img_feat_i,  # 使用原始特征
+                        pose=current_pose_mat,
+                        depth=current_depth,
+                        conf=current_conf,
+                        pts3d=world_pts3d
+                    )
+                    if i % 50 == 0:
+                        stats = self.slam_keyframe_bank.get_stats()
+                        print(f"[SLAM-KMB] Frame {i}: Added ({reason}), "
+                              f"keyframes={stats['num_keyframes']}, edges={stats['num_edges']}")
+
+            # Add current frame to original Keyframe Memory Bank if enabled (fallback)
+            elif self.keyframe_memory_bank is not None and self.pose_head_flag:
                 proj_global_feat = self.pose_retriever.proj_q(global_img_feat_i)
-
-                # Prepare geometric info (transform pts3d to world coords if possible)
-                world_pts3d = None
-                if current_pts3d is not None and current_pose_mat is not None:
-                    # Transform points from camera coords to world coords
-                    from src.dust3r.utils.geometry import geotrf
-                    world_pts3d = geotrf(current_pose_mat, current_pts3d)
 
                 # Add with geometric information
                 added = self.keyframe_memory_bank.add(
@@ -2266,6 +3157,11 @@ class ARCroco3DStereo(CroCoNet):
                             'confidence': float(conf_val),
                         })
                         print(f"[Loop Closure + Memory Recall] Frame {i}: Recalled memory from frame {int(frame_id_val)} (confidence={conf_val:.3f}, blend={conf_val*0.3:.3f})")
+
+                        # Add loop edge to SLAM bank if available
+                        if self.slam_keyframe_bank is not None:
+                            self.slam_keyframe_bank.add_loop_edge(i, int(frame_id_val))
+                            print(f"[SLAM-KMB] Added loop edge: {i} <-> {int(frame_id_val)}")
 
                     # Add keyframe at fixed intervals (with memory state)
                     _kf_interval = getattr(self.config, 'loop_closure_keyframe_interval', 10)

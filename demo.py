@@ -317,7 +317,7 @@ def parse_args():
     parser.add_argument(
         "--keyframe_memory_lambda_time",
         type=float,
-        default=0.1,
+        default=0.5,
         help="Weight for time similarity in hybrid similarity calculation",
     )
     parser.add_argument(
@@ -396,6 +396,54 @@ def parse_args():
         type=float,
         default=0.5,
         help="Weight for depth consistency fusion (0-1)",
+    )
+    # SLAM-aware keyframe bank arguments
+    parser.add_argument(
+        "--use_slam_aware_keyframe_bank",
+        action="store_true",
+        help="Enable SLAM-aware keyframe bank with multi-signal decision and pose graph",
+    )
+    parser.add_argument(
+        "--slam_baseline_threshold",
+        type=float,
+        default=0.1,
+        help="Baseline threshold for keyframe selection (relative to scene scale)",
+    )
+    parser.add_argument(
+        "--slam_rotation_threshold",
+        type=float,
+        default=15.0,
+        help="Rotation threshold in degrees for keyframe selection",
+    )
+    parser.add_argument(
+        "--slam_coverage_threshold",
+        type=float,
+        default=0.7,
+        help="View coverage threshold (0-1) for keyframe selection",
+    )
+    parser.add_argument(
+        "--slam_reproj_threshold",
+        type=float,
+        default=5.0,
+        help="Reprojection error threshold in pixels for keyframe selection",
+    )
+    parser.add_argument(
+        "--slam_alpha_feature",
+        type=float,
+        default=0.3,
+        help="Weight for feature similarity in SLAM-aware retrieval",
+    )
+    parser.add_argument(
+        "--slam_beta_overlap",
+        type=float,
+        default=0.5,
+        help="Weight for view overlap in SLAM-aware retrieval",
+    )
+    parser.add_argument(
+        "--slam_gamma_graph",
+        type=float,
+        default=0.2,
+        help="Weight for graph distance penalty in SLAM-aware retrieval",
     )
     return parser.parse_args()
 
@@ -1093,6 +1141,42 @@ def run_inference(args):
         print(f"Depth Consistency enabled: top_k={args.depth_consistency_top_k}, "
               f"weight={args.depth_consistency_weight}")
 
+    # Configure SLAM-aware Keyframe Bank
+    if args.use_slam_aware_keyframe_bank:
+        from src.dust3r.model import SLAMAwareKeyframeBank
+
+        model.config.use_slam_aware_keyframe_bank = True
+        model.config.slam_baseline_threshold = args.slam_baseline_threshold
+        model.config.slam_rotation_threshold = args.slam_rotation_threshold
+        model.config.slam_coverage_threshold = args.slam_coverage_threshold
+        model.config.slam_reproj_threshold = args.slam_reproj_threshold
+        model.config.slam_alpha_feature = args.slam_alpha_feature
+        model.config.slam_beta_overlap = args.slam_beta_overlap
+        model.config.slam_gamma_graph = args.slam_gamma_graph
+
+        # Enable pose_head_flag since SLAM bank requires poses
+        model.pose_head_flag = True
+
+        # Initialize SLAM-aware keyframe bank
+        if not hasattr(model, 'slam_keyframe_bank') or model.slam_keyframe_bank is None:
+            print("Initializing SLAM-aware Keyframe Bank...")
+            model.slam_keyframe_bank = SLAMAwareKeyframeBank(
+                max_size=args.keyframe_memory_max_size or 100,
+                device=device,
+                baseline_threshold=args.slam_baseline_threshold,
+                rotation_threshold=args.slam_rotation_threshold,
+                coverage_threshold=args.slam_coverage_threshold,
+                reproj_threshold=args.slam_reproj_threshold,
+                alpha_feature=args.slam_alpha_feature,
+                beta_overlap=args.slam_beta_overlap,
+                gamma_graph=args.slam_gamma_graph,
+            )
+
+        print(f"SLAM-aware Keyframe Bank enabled: "
+              f"baseline_th={args.slam_baseline_threshold}, "
+              f"rotation_th={args.slam_rotation_threshold}, "
+              f"alpha={args.slam_alpha_feature}, beta={args.slam_beta_overlap}, gamma={args.slam_gamma_graph}")
+
     model.eval()
 
     # Run inference.
@@ -1106,6 +1190,15 @@ def run_inference(args):
     print(
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame), FPS: {FPS_num:.2f}."
     )
+
+    # 应用回溯尺度校正（如果启用了深度一致性）
+    if args.use_depth_consistency and hasattr(model, 'keyframe_memory_bank') and model.keyframe_memory_bank is not None:
+        drift_detected, cumulative_scale = model.keyframe_memory_bank.detect_scale_drift(threshold=0.05)
+        if drift_detected:
+            print(f"\n[Retrospective] 检测到尺度漂移: cumulative={cumulative_scale:.4f}")
+            outputs = model.keyframe_memory_bank.apply_retrospective_correction(outputs)
+        else:
+            print(f"[Retrospective] 尺度漂移在可接受范围内: cumulative={cumulative_scale:.4f}")
 
     # 如果使用 global alignment，先将 outputs 保存到磁盘（参考 VGGT-Long）
     disk_cache = None
