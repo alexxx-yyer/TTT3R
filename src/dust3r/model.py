@@ -938,6 +938,763 @@ class KeyframeMemoryBank:
         self.size = 0
 
 
+class KeyframeMemoryBankV2:
+    """
+    Optimized Keyframe Memory Bank with anchor mechanism and vectorized operations.
+
+    改进点 (参考 InfiniteVGGT):
+    1. 锚点机制 - 保护初始帧不被剪枝
+    2. Tensor 化存储 - 预分配 buffer，避免频繁 list append
+    3. 向量化计算 - 批量计算相似度，避免 for 循环
+    4. Query-based 检索 - 基于当前 query 计算相关性
+
+    与原 KeyframeMemoryBank 完全兼容。
+    """
+
+    def __init__(self, max_size=64, device='cuda', diversity_threshold=0.9,
+                 min_interval=10, num_anchor_frames=1, feat_dim=1024, pose_feat_dim=768):
+        """
+        Initialize the Optimized Keyframe Memory Bank.
+
+        Args:
+            max_size: Maximum number of keyframes to store
+            device: Device to store tensors on
+            diversity_threshold: Only add frames with max similarity below this threshold
+            min_interval: Minimum frame interval between keyframes
+            num_anchor_frames: Number of initial frames to protect from eviction
+            feat_dim: Dimension of global features
+            pose_feat_dim: Dimension of pose features
+        """
+        self.max_size = max_size
+        self.device = device
+        self.diversity_threshold = diversity_threshold
+        self.min_interval = min_interval
+        self.num_anchor_frames = num_anchor_frames
+        self.feat_dim = feat_dim
+        self.pose_feat_dim = pose_feat_dim
+
+        # Tensor 化存储 - 预分配 buffer
+        self.features = torch.zeros(max_size, 1, feat_dim, device=device)
+        self.pose_features = torch.zeros(max_size, 1, pose_feat_dim, device=device)
+        self.timestamps = torch.zeros(max_size, dtype=torch.long, device=device)
+
+        # 几何信息使用 List（因为尺寸可能不同）
+        self.depths = [None] * max_size
+        self.confs = [None] * max_size
+        self.camera_poses = [None] * max_size
+        self.pts3d = [None] * max_size
+
+        # Scale history
+        self.scale_history = []
+        self.cumulative_scale = 1.0
+
+        # 计数器
+        self.size = 0
+
+        # 缓存归一化特征（加速检索）
+        self._features_normalized = None
+        self._cache_valid = False
+
+    def _invalidate_cache(self):
+        """Invalidate normalized feature cache."""
+        self._cache_valid = False
+        self._features_normalized = None
+
+    def _update_cache(self):
+        """Update normalized feature cache for fast retrieval."""
+        if self._cache_valid or self.size == 0:
+            return
+
+        valid_features = self.features[:self.size]  # [N, 1, C]
+        self._features_normalized = F.normalize(valid_features, p=2, dim=-1)
+        self._cache_valid = True
+
+    # ==================== 向量化相似度计算 ====================
+
+    def compute_similarities_vectorized(self, query_feat):
+        """
+        Vectorized cosine similarity computation.
+
+        Args:
+            query_feat: [B, 1, C] query feature
+
+        Returns:
+            similarities: [N] similarity scores for all keyframes
+        """
+        if self.size == 0:
+            return None
+
+        self._update_cache()
+
+        # query: [B, 1, C] -> [1, C] (assume B=1)
+        query_norm = F.normalize(query_feat.squeeze(0), p=2, dim=-1)  # [1, C]
+
+        # bank: [N, 1, C] -> [N, C]
+        bank_norm = self._features_normalized.squeeze(1)  # [N, C]
+
+        # 向量化点积: [N, C] @ [C, 1] -> [N, 1] -> [N]
+        similarities = torch.mm(bank_norm, query_norm.t()).squeeze(-1)
+
+        return similarities
+
+    def compute_max_similarity_vectorized(self, query_feat):
+        """Vectorized max similarity computation."""
+        sims = self.compute_similarities_vectorized(query_feat)
+        if sims is None:
+            return -1.0
+        return sims.max().item()
+
+    def compute_time_similarity_vectorized(self, query_time):
+        """
+        Vectorized time similarity using Gaussian decay.
+
+        Formula: sim_time = exp(-(time_diff)^2)
+
+        Args:
+            query_time: Scalar query timestamp (frame index)
+
+        Returns:
+            time_sims: [N] time similarity scores for all keyframes
+        """
+        if self.size == 0:
+            return None
+
+        # timestamps[:size] 是有效的时间戳
+        time_diffs = query_time - self.timestamps[:self.size].float()
+        time_sims = torch.exp(-(time_diffs ** 2) / 100.0)  # 除以100使衰减更平滑
+        return time_sims
+
+    def compute_hybrid_similarity_vectorized(self, query_feat, query_time, lambda_time=0.1):
+        """
+        Vectorized hybrid similarity computation.
+
+        Formula: sim_hybrid = sim_cos + lambda_time * sim_time
+
+        Args:
+            query_feat: [B, 1, C] query feature
+            query_time: Scalar query timestamp (frame index)
+            lambda_time: Weight for time similarity
+
+        Returns:
+            hybrid_sims: [N] hybrid similarity scores for all keyframes
+        """
+        if self.size == 0:
+            return None
+
+        # 特征相似度
+        cos_sims = self.compute_similarities_vectorized(query_feat)  # [N]
+
+        # 时间相似度
+        time_sims = self.compute_time_similarity_vectorized(query_time)  # [N]
+
+        # 混合相似度
+        hybrid_sims = cos_sims + lambda_time * time_sims
+
+        return hybrid_sims
+
+    # ==================== Attention-weighted 相似度 ====================
+
+    def update_attention_weights(self, indices, attn_weights):
+        """
+        更新关键帧的 attention 权重（从 inquire_with_keyframes 获取）。
+
+        Args:
+            indices: List of keyframe indices that were used
+            attn_weights: [K] attention weights for each keyframe
+        """
+        if not hasattr(self, 'attention_scores'):
+            # 初始化 attention 累积分数
+            self.attention_scores = torch.zeros(self.max_size, device=self.device)
+            self.attention_counts = torch.zeros(self.max_size, device=self.device)
+
+        for i, idx in enumerate(indices):
+            if idx < self.max_size:
+                self.attention_scores[idx] += attn_weights[i] if isinstance(attn_weights, torch.Tensor) else attn_weights
+                self.attention_counts[idx] += 1
+
+    def get_attention_importance(self):
+        """
+        获取每个关键帧的平均 attention 重要性分数。
+
+        Returns:
+            importance: [N] normalized attention importance for each keyframe
+        """
+        if not hasattr(self, 'attention_scores') or self.size == 0:
+            return torch.ones(self.size, device=self.device) / self.size
+
+        valid_counts = self.attention_counts[:self.size].clamp(min=1)
+        avg_attention = self.attention_scores[:self.size] / valid_counts
+
+        # 归一化到 [0, 1]
+        if avg_attention.max() > avg_attention.min():
+            importance = (avg_attention - avg_attention.min()) / (avg_attention.max() - avg_attention.min())
+        else:
+            importance = torch.ones_like(avg_attention) / self.size
+
+        return importance
+
+    def compute_attention_weighted_similarity(self, query_feat, attn_importance=None):
+        """
+        计算 attention 加权的相似度。
+
+        思路：不是简单的余弦相似度，而是考虑历史 attention 的重要性。
+        被模型频繁关注的关键帧，可能更有价值。
+
+        Args:
+            query_feat: [B, 1, C] query feature
+            attn_importance: [N] optional attention importance weights
+
+        Returns:
+            weighted_sims: [N] attention-weighted similarity scores
+        """
+        if self.size == 0:
+            return None
+
+        # 基础余弦相似度
+        cos_sims = self.compute_similarities_vectorized(query_feat)  # [N]
+
+        # 获取 attention 重要性
+        if attn_importance is None:
+            attn_importance = self.get_attention_importance()  # [N]
+
+        # 加权相似度：结合特征相似性和历史重要性
+        # 公式: weighted_sim = cos_sim * (1 + alpha * attention_importance)
+        alpha = 0.5  # attention 重要性的权重
+        weighted_sims = cos_sims * (1.0 + alpha * attn_importance)
+
+        return weighted_sims
+
+    def retrieve_attention_weighted(self, query_feat, k, use_diversity=True, alpha_attn=0.3):
+        """
+        基于 attention 加权的检索方法。
+
+        综合考虑：
+        1. Bank 内部多样性（与平均特征的差异）
+        2. 历史 attention 重要性（被模型频繁关注的帧）
+        3. 与 query 的相关性（可选）
+
+        Args:
+            query_feat: [B, 1, C] query feature
+            k: Number of keyframes to retrieve
+            use_diversity: Whether to include diversity score
+            alpha_attn: Weight for attention importance
+
+        Returns:
+            keyframe_features: [B, K, 2*C] concatenated features
+            indices: List of selected keyframe indices
+        """
+        if self.size == 0:
+            return None, []
+
+        self._update_cache()
+
+        # 1. 多样性分数（与平均特征的差异）
+        bank_norm = self._features_normalized.squeeze(1)[:self.size]  # [N, C]
+        mean_vector = F.normalize(bank_norm.mean(dim=0, keepdim=True), p=2, dim=-1)
+        mean_sims = torch.mm(bank_norm, mean_vector.t()).squeeze(-1)
+        diversity_scores = 1.0 - mean_sims  # [N]
+
+        # 2. Attention 重要性分数
+        attn_importance = self.get_attention_importance()  # [N]
+
+        # 3. 综合分数
+        if use_diversity:
+            # 综合多样性和 attention 重要性
+            combined_scores = diversity_scores + alpha_attn * attn_importance
+        else:
+            combined_scores = attn_importance
+
+        # 选择最高分数的 k 帧
+        actual_k = min(k, self.size)
+        _, top_k_indices = torch.topk(combined_scores, k=actual_k, dim=0)
+        top_k_indices = top_k_indices.cpu().tolist()
+        if not isinstance(top_k_indices, list):
+            top_k_indices = [top_k_indices]
+
+        # Debug 输出
+        if self.size > 0 and hasattr(self, 'attention_scores'):
+            print(f"[KMB-V2 Attn] diversity=[{diversity_scores.min():.3f}, {diversity_scores.max():.3f}], "
+                  f"attn_imp=[{attn_importance.min():.3f}, {attn_importance.max():.3f}], "
+                  f"selected={top_k_indices[:5]}")
+
+        keyframe_features = self._gather_features(top_k_indices)
+        return keyframe_features, top_k_indices
+
+    # ==================== 锚点感知的剪枝 ====================
+
+    def _evict_most_redundant_with_anchor(self):
+        """
+        Evict the most redundant keyframe while protecting anchor frames.
+
+        参考 InfiniteVGGT 的 eviction 策略:
+        - 锚点帧（前 num_anchor_frames 帧）永不剪枝
+        - 候选帧中选择与平均特征最相似的剪枝
+        """
+        if self.size <= self.num_anchor_frames + 1:
+            return  # 不够剪枝
+
+        self._update_cache()
+
+        # 分离锚点和候选
+        anchor_features = self._features_normalized[:self.num_anchor_frames]  # [A, 1, C]
+        candidate_features = self._features_normalized[self.num_anchor_frames:self.size]  # [C, 1, C]
+
+        if candidate_features.shape[0] == 0:
+            return
+
+        # 计算候选帧与平均特征的相似度
+        candidate_norm = candidate_features.squeeze(1)  # [C, C_dim]
+        mean_vector = candidate_norm.mean(dim=0, keepdim=True)  # [1, C_dim]
+        mean_vector = F.normalize(mean_vector, p=2, dim=-1)
+
+        # 相似度分数（高 = 冗余）
+        scores = torch.mm(candidate_norm, mean_vector.t()).squeeze(-1)  # [C]
+
+        # 找到最冗余的（最高相似度）
+        max_idx = scores.argmax().item()
+        evict_idx = self.num_anchor_frames + max_idx  # 实际索引
+
+        # 执行剪枝 - 将后面的元素前移
+        self._evict_at_index(evict_idx)
+
+    def _evict_at_index(self, idx):
+        """Remove keyframe at given index and shift remaining elements."""
+        if idx >= self.size:
+            return
+
+        # Tensor 数据前移
+        if idx < self.size - 1:
+            self.features[idx:self.size-1] = self.features[idx+1:self.size].clone()
+            self.pose_features[idx:self.size-1] = self.pose_features[idx+1:self.size].clone()
+            self.timestamps[idx:self.size-1] = self.timestamps[idx+1:self.size].clone()
+
+        # List 数据前移
+        for i in range(idx, self.size - 1):
+            self.depths[i] = self.depths[i + 1]
+            self.confs[i] = self.confs[i + 1]
+            self.camera_poses[i] = self.camera_poses[i + 1]
+            self.pts3d[i] = self.pts3d[i + 1]
+
+        # 清理最后位置
+        self.depths[self.size - 1] = None
+        self.confs[self.size - 1] = None
+        self.camera_poses[self.size - 1] = None
+        self.pts3d[self.size - 1] = None
+
+        self.size -= 1
+        self._invalidate_cache()
+
+    # ==================== Add & Retrieve ====================
+
+    def add(self, frame_idx, global_feat, pose_feat,
+            depth=None, conf=None, camera_pose=None, pts3d=None, force_add=False):
+        """
+        Add a keyframe to the memory bank with diversity check.
+
+        与原 KeyframeMemoryBank.add() 完全兼容。
+        """
+        global_feat = global_feat.to(self.device)
+        pose_feat = pose_feat.to(self.device)
+
+        # Diversity check (向量化)
+        if not force_add and self.size > 0:
+            max_sim = self.compute_max_similarity_vectorized(global_feat)
+            last_timestamp = self.timestamps[self.size - 1].item() if self.size > 0 else 0
+            time_since_last = frame_idx - last_timestamp
+
+            if time_since_last >= self.min_interval:
+                pass  # Force add due to time interval
+            elif max_sim >= self.diversity_threshold:
+                return False  # Too similar, skip
+
+        # 容量检查 - 先剪枝再添加
+        if self.size >= self.max_size:
+            self._evict_most_redundant_with_anchor()
+
+        # 添加到 Tensor buffer
+        idx = self.size
+        self.features[idx] = global_feat.detach().squeeze(0) if global_feat.dim() == 3 else global_feat.detach()
+        self.pose_features[idx] = pose_feat.detach().squeeze(0) if pose_feat.dim() == 3 else pose_feat.detach()
+        self.timestamps[idx] = frame_idx
+
+        # 几何信息
+        self.depths[idx] = depth.detach().clone().to(self.device) if depth is not None else None
+        self.confs[idx] = conf.detach().clone().to(self.device) if conf is not None else None
+        self.camera_poses[idx] = camera_pose.detach().clone().to(self.device) if camera_pose is not None else None
+        self.pts3d[idx] = pts3d.detach().clone().to(self.device) if pts3d is not None else None
+
+        self.size += 1
+        self._invalidate_cache()
+
+        return True
+
+    def retrieve_diverse(self, query_feat, k):
+        """
+        Retrieve top-k most DIVERSE keyframes based on bank internal diversity.
+
+        改进：基于与平均特征的差异（InfiniteVGGT 方法），而不是与 query 的相似度。
+        这样选出的关键帧彼此之间更加多样，而不是都与 query 不同但彼此相似。
+
+        Args:
+            query_feat: [B, 1, C] query feature (用于 attention-weighted，可选)
+            k: Number of keyframes to retrieve
+
+        Returns:
+            keyframe_features: [B, K, 2*C] concatenated features
+            indices: List of selected keyframe indices
+        """
+        if self.size == 0:
+            return None, []
+
+        self._update_cache()
+
+        # 计算 bank 内部多样性：与平均特征的差异
+        bank_norm = self._features_normalized.squeeze(1)[:self.size]  # [N, C]
+        mean_vector = F.normalize(bank_norm.mean(dim=0, keepdim=True), p=2, dim=-1)  # [1, C]
+
+        # 多样性分数 = 1 - cosine(feat, mean)，越大越多样
+        mean_similarities = torch.mm(bank_norm, mean_vector.t()).squeeze(-1)  # [N]
+        diversity_scores = 1.0 - mean_similarities  # [N]
+
+        # 选择多样性最高的 k 帧
+        actual_k = min(k, self.size)
+        _, top_k_indices = torch.topk(diversity_scores, k=actual_k, dim=0)
+        top_k_indices = top_k_indices.cpu().tolist()
+        if not isinstance(top_k_indices, list):
+            top_k_indices = [top_k_indices]
+
+        keyframe_features = self._gather_features(top_k_indices)
+        return keyframe_features, top_k_indices
+
+    def retrieve_similar(self, query_feat, k, min_frame_gap=10):
+        """
+        Retrieve top-k most SIMILAR keyframes (highest similarity to query).
+        向量化实现。
+        """
+        if self.size == 0:
+            return [], []
+
+        similarities = self.compute_similarities_vectorized(query_feat)  # [N]
+
+        # 获取当前时间戳
+        current_time = self.timestamps[self.size - 1].item() + 1 if self.size > 0 else 0
+
+        # 创建有效掩码（排除太近的帧）
+        time_gaps = current_time - self.timestamps[:self.size]
+        valid_mask = time_gaps >= min_frame_gap
+
+        if not valid_mask.any():
+            return [], []
+
+        # 将无效位置的相似度设为 -inf
+        masked_sims = similarities.clone()
+        masked_sims[~valid_mask] = float('-inf')
+
+        # 选择最相似的
+        actual_k = min(k, valid_mask.sum().item())
+        if actual_k == 0:
+            return [], []
+
+        top_sims, top_indices = torch.topk(masked_sims, k=actual_k, dim=0)
+
+        selected_indices = top_indices.cpu().tolist()
+        selected_sims = top_sims.cpu().tolist()
+
+        if not isinstance(selected_indices, list):
+            selected_indices = [selected_indices]
+            selected_sims = [selected_sims]
+
+        return selected_indices, selected_sims
+
+    def retrieve_query_aware(self, query_feat, k, alpha_diversity=0.5, alpha_query=0.5):
+        """
+        Query-aware retrieval: 同时考虑多样性和与 query 的相关性。
+
+        策略:
+        - 高 query 相关性 = 可能有用的参考帧
+        - 高多样性 = 避免冗余
+        - 综合分数 = alpha_diversity * diversity_score + alpha_query * query_relevance
+
+        Args:
+            query_feat: [B, 1, C] query feature
+            k: Number of keyframes to retrieve
+            alpha_diversity: Weight for diversity (lower similarity to mean)
+            alpha_query: Weight for query relevance
+
+        Returns:
+            keyframe_features: [B, K, 2*C] concatenated features
+            indices: List of selected keyframe indices
+        """
+        if self.size == 0:
+            return None, []
+
+        self._update_cache()
+
+        # 1. Query 相关性分数
+        query_sims = self.compute_similarities_vectorized(query_feat)  # [N]
+
+        # 2. 多样性分数（与平均特征的差异）
+        bank_norm = self._features_normalized.squeeze(1)  # [N, C]
+        mean_vector = F.normalize(bank_norm.mean(dim=0, keepdim=True), p=2, dim=-1)
+        mean_sims = torch.mm(bank_norm, mean_vector.t()).squeeze(-1)  # [N]
+        diversity_scores = 1.0 - mean_sims  # 与平均越不同，多样性越高
+
+        # 3. 综合分数
+        combined_scores = alpha_diversity * diversity_scores + alpha_query * query_sims
+
+        # 选择最高分数
+        actual_k = min(k, self.size)
+        _, top_k_indices = torch.topk(combined_scores, k=actual_k, dim=0)
+        top_k_indices = top_k_indices.cpu().tolist()
+        if not isinstance(top_k_indices, list):
+            top_k_indices = [top_k_indices]
+
+        keyframe_features = self._gather_features(top_k_indices)
+        return keyframe_features, top_k_indices
+
+    def _gather_features(self, indices):
+        """Gather features for given indices (向量化)."""
+        if len(indices) == 0:
+            return None
+
+        indices_tensor = torch.tensor(indices, device=self.device, dtype=torch.long)
+
+        # 直接索引 tensor
+        global_feats = self.features[indices_tensor]  # [K, 1, C1]
+        pose_feats = self.pose_features[indices_tensor]  # [K, 1, C2]
+
+        # 拼接
+        combined = torch.cat([global_feats, pose_feats], dim=-1)  # [K, 1, C1+C2]
+
+        # 调整形状: [K, 1, C] -> [1, K, C] (B=1)
+        keyframe_features = combined.permute(1, 0, 2)  # [1, K, C]
+
+        return keyframe_features
+
+    # ==================== 兼容方法 ====================
+
+    def compute_cosine_similarity(self, query_feat, bank_feat):
+        """兼容原接口的单对相似度计算。"""
+        query_norm = F.normalize(query_feat, p=2, dim=-1)
+        bank_norm = F.normalize(bank_feat, p=2, dim=-1)
+        cosine_sim = (query_norm * bank_norm).sum(dim=-1, keepdim=True)
+        return cosine_sim.squeeze(-1)
+
+    def compute_depth_consistency(self, current_depth, current_conf, current_pose,
+                                   current_pts3d, query_feat, k=3,
+                                   min_frame_gap=10, conf_threshold=1.5):
+        """与原 KeyframeMemoryBank 完全兼容的深度一致性计算。"""
+        B, H, W = current_depth.shape
+        device = current_depth.device
+
+        similar_indices, similarities = self.retrieve_similar(query_feat, k, min_frame_gap)
+
+        valid_indices = []
+        for idx in similar_indices:
+            if (self.pts3d[idx] is not None and
+                self.camera_poses[idx] is not None and
+                self.confs[idx] is not None):
+                valid_indices.append(idx)
+
+        if len(valid_indices) == 0:
+            return None, None, {'num_keyframes': 0, 'valid_points': 0}
+
+        ref_depth_sum = torch.zeros(B, H, W, device=device)
+        ref_weight_sum = torch.zeros(B, H, W, device=device)
+        total_valid_points = 0
+
+        for idx in valid_indices:
+            hist_pts3d = self.pts3d[idx]
+            hist_conf = self.confs[idx]
+            hist_pose = self.camera_poses[idx]
+
+            projected_depth, projection_mask, projection_conf = self._project_points_to_view(
+                hist_pts3d, hist_conf, hist_pose, current_pose, H, W, conf_threshold
+            )
+
+            if projected_depth is None:
+                continue
+
+            combined_weight = projection_conf * projection_mask.float()
+            ref_depth_sum += projected_depth * combined_weight
+            ref_weight_sum += combined_weight
+            total_valid_points += projection_mask.sum().item()
+
+        valid_mask = ref_weight_sum > 1e-6
+        ref_depth = torch.where(valid_mask, ref_depth_sum / (ref_weight_sum + 1e-6), current_depth)
+        ref_weight = ref_weight_sum / (len(valid_indices) + 1e-6)
+        ref_weight = torch.clamp(ref_weight, 0, 1)
+
+        return ref_depth, ref_weight, {
+            'num_keyframes': len(valid_indices),
+            'valid_points': total_valid_points,
+            'keyframe_indices': valid_indices,
+        }
+
+    def _project_points_to_view(self, pts3d_world, conf, src_pose, tgt_pose, H, W, conf_threshold):
+        """投影 3D 点到目标视图（与原实现相同）。"""
+        B = pts3d_world.shape[0]
+        device = pts3d_world.device
+
+        tgt_pose_inv = torch.inverse(tgt_pose)
+        pts_flat = pts3d_world.reshape(B, -1, 3)
+        R = tgt_pose_inv[:, :3, :3]
+        t = tgt_pose_inv[:, :3, 3:4]
+
+        pts_cam = torch.bmm(pts_flat, R.transpose(1, 2)) + t.transpose(1, 2)
+        pts_cam = pts_cam.reshape(B, H, W, 3)
+
+        projected_depth = pts_cam[..., 2]
+        conf_flat = conf.reshape(B, H, W)
+        valid_mask = (projected_depth > 0.01) & (projected_depth < 100) & (conf_flat > conf_threshold)
+        projection_conf = torch.where(valid_mask, conf_flat / (conf_flat.max() + 1e-6), torch.zeros_like(conf_flat))
+
+        return projected_depth, valid_mask, projection_conf
+
+    def align_depth_scale(self, current_depth, current_conf, ref_depth, ref_weight,
+                           min_valid_ratio=0.1, conf_threshold=1.5):
+        """与原 KeyframeMemoryBank 完全兼容的深度尺度对齐。"""
+        if ref_depth is None or ref_weight is None:
+            return current_depth, {'scale': 1.0, 'valid_ratio': 0.0, 'applied': False}
+
+        B, H, W = current_depth.shape
+        device = current_depth.device
+
+        valid_mask = (ref_weight > 0.1) & (current_depth > 0.01) & (current_conf > conf_threshold)
+
+        aligned_depths = []
+        scale_infos = []
+
+        for b in range(B):
+            valid_b = valid_mask[b]
+            valid_ratio = valid_b.float().mean().item()
+
+            if valid_ratio < min_valid_ratio:
+                aligned_depths.append(current_depth[b])
+                scale_infos.append({'scale': 1.0, 'valid_ratio': valid_ratio, 'applied': False})
+                continue
+
+            curr_valid = current_depth[b][valid_b]
+            ref_valid = ref_depth[b][valid_b]
+            ratios = ref_valid / (curr_valid + 1e-6)
+            reasonable_mask = (ratios > 0.5) & (ratios < 2.0)
+
+            if reasonable_mask.sum() < 100:
+                aligned_depths.append(current_depth[b])
+                scale_infos.append({'scale': 1.0, 'valid_ratio': valid_ratio, 'applied': False})
+                continue
+
+            valid_ratios = ratios[reasonable_mask]
+            scale = torch.median(valid_ratios).item()
+            scale = max(0.8, min(1.2, scale))
+
+            aligned_depth_b = current_depth[b] * scale
+            aligned_depths.append(aligned_depth_b)
+            scale_infos.append({
+                'scale': scale,
+                'valid_ratio': valid_ratio,
+                'num_valid': reasonable_mask.sum().item(),
+                'applied': True
+            })
+
+        aligned_depth = torch.stack(aligned_depths, dim=0)
+        avg_scale = sum(s['scale'] for s in scale_infos) / len(scale_infos)
+        any_applied = any(s['applied'] for s in scale_infos)
+
+        return aligned_depth, {
+            'scale': avg_scale,
+            'valid_ratio': sum(s['valid_ratio'] for s in scale_infos) / len(scale_infos),
+            'applied': any_applied,
+            'per_batch': scale_infos
+        }
+
+    def record_scale(self, frame_idx, scale_factor, ref_frame_idx=None):
+        """记录尺度校正历史。"""
+        self.scale_history.append({
+            'frame_idx': frame_idx,
+            'scale': scale_factor,
+            'ref_frame_idx': ref_frame_idx,
+            'cumulative': self.cumulative_scale * scale_factor
+        })
+        self.cumulative_scale *= scale_factor
+
+    def retrieve_top_k(self, query_feat, query_time, k, lambda_time):
+        """
+        Retrieve top-k keyframes using simple uniform temporal sampling + recent frames.
+
+        简单有效的策略：
+        - 一半从历史帧中均匀采样（保证时间覆盖）
+        - 一半选最近的帧（保证局部连续性）
+
+        Args:
+            query_feat: [B, 1, C] query feature (unused, kept for API compatibility)
+            query_time: Scalar query timestamp (unused)
+            k: Number of top keyframes to retrieve
+            lambda_time: (unused, kept for API compatibility)
+
+        Returns:
+            keyframe_features: [B, K, 2*C] concatenated features
+            indices: List of selected keyframe indices
+        """
+        if self.size == 0:
+            return None, []
+
+        actual_k = min(k, self.size)
+
+        if self.size <= actual_k:
+            # 帧数不够，全部返回
+            top_k_indices = list(range(self.size))
+        else:
+            # 一半均匀采样，一半最近帧
+            num_uniform = actual_k // 2
+            num_recent = actual_k - num_uniform
+
+            # 均匀采样（从整个历史中）
+            step = self.size / num_uniform
+            uniform_indices = [int(i * step) for i in range(num_uniform)]
+
+            # 最近的帧
+            recent_indices = list(range(self.size - num_recent, self.size))
+
+            # 合并并去重
+            top_k_indices = list(dict.fromkeys(uniform_indices + recent_indices))
+
+            # 如果去重后不够 k 个，补充其他帧
+            if len(top_k_indices) < actual_k:
+                all_indices = set(range(self.size))
+                remaining = list(all_indices - set(top_k_indices))
+                top_k_indices.extend(remaining[:actual_k - len(top_k_indices)])
+
+            top_k_indices = top_k_indices[:actual_k]
+
+        keyframe_features = self._gather_features(top_k_indices)
+        return keyframe_features, top_k_indices
+
+    def clear(self):
+        """Clear all stored keyframes."""
+        self.features.zero_()
+        self.pose_features.zero_()
+        self.timestamps.zero_()
+        self.depths = [None] * self.max_size
+        self.confs = [None] * self.max_size
+        self.camera_poses = [None] * self.max_size
+        self.pts3d = [None] * self.max_size
+        self.scale_history = []
+        self.cumulative_scale = 1.0
+        self.size = 0
+        self._invalidate_cache()
+
+    def get_stats(self):
+        """获取 Memory Bank 统计信息。"""
+        return {
+            'size': self.size,
+            'max_size': self.max_size,
+            'num_anchor_frames': self.num_anchor_frames,
+            'cache_valid': self._cache_valid,
+            'cumulative_scale': self.cumulative_scale,
+        }
+
+
 class SLAMAwareKeyframeBank:
     """
     SLAM-aware Keyframe Memory Bank
@@ -1900,13 +2657,17 @@ class ARCroco3DStereo(CroCoNet):
         )
         self.set_freeze(config.freeze)
         
-        # Initialize Keyframe Memory Bank if enabled
+        # Initialize Keyframe Memory Bank if enabled (V2 with anchor mechanism)
         if config.use_keyframe_memory_bank:
-            self.keyframe_memory_bank = KeyframeMemoryBank(
-                max_size=config.keyframe_memory_max_size,
+            # Note: global_feat is projected by proj_q (k_dim -> v_dim), so feat_dim = dec_embed_dim
+            self.keyframe_memory_bank = KeyframeMemoryBankV2(
+                max_size=config.keyframe_memory_max_size or 64,
                 device='cuda',  # Will be set properly during inference
                 diversity_threshold=config.keyframe_memory_diversity_threshold,
-                min_interval=getattr(config, 'keyframe_memory_min_interval', 10)
+                min_interval=getattr(config, 'keyframe_memory_min_interval', 10),
+                num_anchor_frames=1,  # 保护初始帧不被剪枝
+                feat_dim=self.dec_embed_dim,      # 768, proj_global_feat 维度
+                pose_feat_dim=self.dec_embed_dim  # 768, out_pose_feat 维度
             )
         else:
             self.keyframe_memory_bank = None

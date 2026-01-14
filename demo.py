@@ -1066,17 +1066,21 @@ def run_inference(args):
     model.config.keyframe_memory_max_size = args.keyframe_memory_max_size
     model.config.keyframe_memory_diversity_threshold = args.keyframe_memory_diversity_threshold
 
-    # Initialize Keyframe Memory Bank if enabled
+    # Initialize Keyframe Memory Bank if enabled (V2 with anchor mechanism)
     if args.use_keyframe_memory_bank:
-        from src.dust3r.model import KeyframeMemoryBank, LocalMemory
+        from src.dust3r.model import KeyframeMemoryBankV2, LocalMemory
         from functools import partial
         import torch.nn as nn
 
-        model.keyframe_memory_bank = KeyframeMemoryBank(
-            max_size=args.keyframe_memory_max_size,
+        # Note: global_feat is projected by proj_q (k_dim -> v_dim), so feat_dim = dec_embed_dim = 768
+        model.keyframe_memory_bank = KeyframeMemoryBankV2(
+            max_size=args.keyframe_memory_max_size or 64,
             device=device,
             diversity_threshold=args.keyframe_memory_diversity_threshold,
-            min_interval=getattr(args, 'keyframe_memory_min_interval', 10)
+            min_interval=getattr(args, 'keyframe_memory_min_interval', 10),
+            num_anchor_frames=1,  # 保护初始帧不被剪枝
+            feat_dim=model.dec_embed_dim,      # 768, proj_global_feat 维度
+            pose_feat_dim=model.dec_embed_dim  # 768, out_pose_feat 维度
         )
 
         # Enable pose_head_flag since keyframe memory bank requires it

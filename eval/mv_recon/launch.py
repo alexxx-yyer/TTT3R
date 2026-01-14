@@ -1,5 +1,6 @@
 import os
 import sys
+import gc
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import time
@@ -58,7 +59,7 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            ROOT="/home/share/Dataset/3D_scene/7scenes/", # "./data/7scenes",
+            ROOT=os.environ.get("DATA_ROOT_7SCENES", "/home/share/Dataset/3D_scene/7scenes/"),
             resolution=resolution,
             num_seq=1,
             full_video=True,
@@ -349,7 +350,17 @@ def main(args):
                     nc1_all_med += nc1_med
                     nc2_all_med += nc2_med
 
-                    # release cuda memory
+                    # release cuda memory - clear model states and intermediate variables
+                    del batch, preds, output, gt_pts, pred_pts, masks, monitoring
+                    del pts_all, pts_gt_all, images_all, masks_all
+                    del pcd, pcd_gt
+                    if hasattr(model, 'keyframe_memory_bank') and model.keyframe_memory_bank is not None:
+                        model.keyframe_memory_bank.clear()
+                    if hasattr(model, 'slam_keyframe_bank') and model.slam_keyframe_bank is not None:
+                        model.slam_keyframe_bank.clear()
+                    if hasattr(model, 'loop_closure_keyframe_db') and model.loop_closure_keyframe_db is not None:
+                        model.loop_closure_keyframe_db.reset(1, device=device)
+                    gc.collect()
                     torch.cuda.empty_cache()
 
             accelerator.wait_for_everyone()

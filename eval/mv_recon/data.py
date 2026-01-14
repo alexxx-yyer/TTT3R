@@ -94,7 +94,9 @@ class SevenScenes(BaseStereoViewDataset):
             print(f"Found {len(self.scene_list)} sequences in split {self.split}")
             return
 
-        scenes = os.listdir(base_dir)
+        scenes = [d for d in os.listdir(base_dir)
+                  if os.path.isdir(osp.join(base_dir, d)) and
+                  os.path.exists(osp.join(base_dir, d, "TestSplit.txt"))]
 
         file_split = {"train": "TrainSplit.txt", "test": "TestSplit.txt"}[self.split]
 
@@ -148,7 +150,7 @@ class SevenScenes(BaseStereoViewDataset):
         while len(imgs_idxs) > 0:
             im_idx = imgs_idxs.popleft()
             impath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.color.png")
-            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.proj.png")
+            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.png")
             posepath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.pose.txt")
 
             rgb_image = imread_cv2(impath)
